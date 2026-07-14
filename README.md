@@ -170,6 +170,22 @@ pytest            # unit + API tests (Piper is mocked; no models needed)
 
 ---
 
+## Performance / benchmarking
+
+Piper runs on CPU, so synthesis speed depends on the host. After deploying to an
+APU, measure it there with the bundled benchmark:
+
+```bash
+python scripts/benchmark.py            # per-voice cold load, memory, RTF, latency
+```
+
+It reports the **real-time factor** (RTF = synthesis_time ÷ audio_seconds) for
+short/medium/long messages. Record results using
+[docs/bench-results-template.md](docs/bench-results-template.md) and use them to
+pick voice quality tiers. Full guidance: [DEPLOY.md §6](DEPLOY.md#6-tuning-for-the-apu-cpu).
+
+---
+
 ## Notes / limitations
 
 - Piper is CPU-based. On a typical APU-class CPU, `medium`-quality voices
