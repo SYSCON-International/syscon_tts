@@ -13,6 +13,10 @@ no internet connection is required.
 - **Voices:** configured in a single JSON manifest; add any of Piper's ~40
   languages by editing one file.
 
+**Documentation:** [DEPLOY.md](DEPLOY.md) (deployment & validation recipes) ·
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (architecture, operations, and full
+API/CLI reference).
+
 ---
 
 ## Voice profiles (default set)
