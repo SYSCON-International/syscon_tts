@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest  # Linux x86-64 — matches the APU target; piper wheels available
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supported interpreter range (piper-phonemize ships wheels for 3.9-3.11).
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (full deps, incl. Piper)
+        # Installs piper-tts too, so CI also proves the dependency stack
+        # resolves on Linux x86-64. Tests mock Piper, so no models are needed.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install -e .
+
+      - name: Run tests
+        run: pytest -q
