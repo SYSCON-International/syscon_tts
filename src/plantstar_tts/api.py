@@ -12,6 +12,8 @@ instance used by uvicorn / the CLI ``serve`` command.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -24,7 +26,7 @@ from .voices import UnknownVoiceError, VoiceNotInstalledError, VoiceRegistry
 
 class SynthesizeRequest(BaseModel):
     text: str = Field(..., description="Text to speak.")
-    voice: str | None = Field(
+    voice: Optional[str] = Field(
         None, description="Voice id. Defaults to the server's default voice."
     )
     format: str = Field("wav", description="Output format: 'wav' or 'mp3'.")
