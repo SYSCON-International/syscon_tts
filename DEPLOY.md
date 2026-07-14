@@ -169,7 +169,49 @@ folder at <https://huggingface.co/rhasspy/piper-voices>.
 
 Rule of thumb on APU-class CPUs: `medium` runs a few times faster than
 real-time; `low` is faster still with a modest quality drop. Measure on the
-actual hardware before committing to a tier.
+actual hardware before committing to a tier — use the benchmark below.
+
+### Benchmarking on the APU (post-deployment)
+
+`scripts/benchmark.py` measures real synthesis performance on the host it runs
+on. Run it **on the APU after deployment** so the numbers reflect the real CPU.
+For each installed voice it reports cold model-load time, resident-memory
+growth, and the **real-time factor (RTF = synth_time ÷ audio_seconds)** plus
+latency for short/medium/long messages.
+
+```bash
+# Bare metal
+source .venv/bin/activate
+python scripts/benchmark.py                 # all installed voices
+python scripts/benchmark.py en_us_amy --runs 5
+
+# Docker (copy the script into the running container, then exec)
+docker cp scripts/benchmark.py plantstar-tts:/app/benchmark.py
+docker exec plantstar-tts python /app/benchmark.py
+
+# Archive results per host for comparison
+python scripts/benchmark.py --json > "bench-$(hostname).json"
+```
+
+Example output (format only — RTF depends entirely on the host CPU):
+
+```
+VOICE            COLD LOAD     MEM  SHORT RTF  MED RTF  LONG RTF  LONG LAT
+--------------------------------------------------------------------------
+en_us_amy           1.312s 119.8MB      0.081    0.095     0.073    1.326s
+...
+```
+
+Interpreting it:
+- **RTF < 1.0** means faster than real-time; the smaller, the snappier. If RTF
+  approaches or exceeds 1.0 for the messages you actually send, drop that voice
+  to its `low` model (above) and re-benchmark.
+- **LONG LAT** is the wall-clock time to synthesize the long sample — the most
+  realistic "how long will an operator wait" figure.
+- **MEM** is the RSS added by loading that voice; sum the voices you expect to
+  keep loaded to size the process.
+- **COLD LOAD** is paid once per voice on first use, then amortized (voices stay
+  cached). Preload critical voices at startup if first-hit latency matters.
 
 ---
 
