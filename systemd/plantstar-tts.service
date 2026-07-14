@@ -1,0 +1,26 @@
+[Unit]
+Description=PlantStar TTS (offline text-to-speech service)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust User/paths to match the APU deployment.
+User=plantstar
+WorkingDirectory=/opt/plantstar-tts
+Environment=PLANTSTAR_TTS_HOME=/opt/plantstar-tts
+Environment=PLANTSTAR_TTS_HOST=0.0.0.0
+Environment=PLANTSTAR_TTS_PORT=5002
+Environment=PLANTSTAR_TTS_DEFAULT_VOICE=en_us_amy
+ExecStart=/opt/plantstar-tts/.venv/bin/plantstar-tts serve
+Restart=on-failure
+RestartSec=3
+
+# Hardening (offline service needs no elevated privileges).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/plantstar-tts
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Downloaded voice models (fetched via scripts/download_voices.sh; large binaries)
+voices/*.onnx
+voices/*.onnx.json
+
+# Generated audio / scratch
+*.wav
+*.mp3

@@ -1,0 +1,65 @@
+{
+  "_comment": "Voice profile catalogue. Each entry maps a stable 'id' to a Piper voice model. To add a voice: copy an entry, set a unique id, and set model/config/model_url/config_url from https://huggingface.co/rhasspy/piper-voices then run scripts/download_voices.sh. Quality levels: low (fastest/smallest), medium (balanced), high (best/largest).",
+  "voices": [
+    {
+      "id": "en_us_amy",
+      "name": "Amy — US English, female",
+      "language": "en_US",
+      "gender": "female",
+      "model": "en_US-amy-medium.onnx",
+      "config": "en_US-amy-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx.json"
+    },
+    {
+      "id": "en_us_ryan",
+      "name": "Ryan — US English, male",
+      "language": "en_US",
+      "gender": "male",
+      "model": "en_US-ryan-medium.onnx",
+      "config": "en_US-ryan-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json"
+    },
+    {
+      "id": "en_gb_alan",
+      "name": "Alan — UK English, male",
+      "language": "en_GB",
+      "gender": "male",
+      "model": "en_GB-alan-medium.onnx",
+      "config": "en_GB-alan-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx.json"
+    },
+    {
+      "id": "es_es_davefx",
+      "name": "DaveFX — Spanish (Spain), male",
+      "language": "es_ES",
+      "gender": "male",
+      "model": "es_ES-davefx-medium.onnx",
+      "config": "es_ES-davefx-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json"
+    },
+    {
+      "id": "fr_fr_siwis",
+      "name": "Siwis — French, female",
+      "language": "fr_FR",
+      "gender": "female",
+      "model": "fr_FR-siwis-medium.onnx",
+      "config": "fr_FR-siwis-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json"
+    },
+    {
+      "id": "de_de_thorsten",
+      "name": "Thorsten — German, male",
+      "language": "de_DE",
+      "gender": "male",
+      "model": "de_DE-thorsten-medium.onnx",
+      "config": "de_DE-thorsten-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json"
+    }
+  ]
+}
