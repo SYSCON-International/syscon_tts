@@ -98,44 +98,78 @@ The package is published to PyPI as
 [`syscon-tts`](https://pypi.org/project/syscon-tts/) using an API token, the
 same approach as `django-search-filter-sort`.
 
-**One-time setup:** create a PyPI API token and add it to this repo as the
-`PYPI_API_TOKEN` secret (Settings → Secrets and variables → Actions). Scope it
-to the `syscon-tts` project once that project exists — the first upload needs
-an account-scoped token, which should then be replaced with a project-scoped
-one.
+### One-time setup
 
-**Each release:**
+Add a section to `~/.pypirc` named for this project, holding its API token.
+Naming the section after the GitHub repo keeps it obvious which token is which
+when several Syscon packages share the file:
+
+```ini
+[distutils]
+index-servers =
+    pypi
+    django-search-filter-sort
+    syscon_tts
+
+[syscon_tts]
+repository = https://upload.pypi.org/legacy/
+username = __token__
+password = pypi-<token>
+```
+
+The very first upload needs an **account-scoped** token, because a
+project-scoped token cannot be created until the project exists. Once
+`syscon-tts` is on PyPI, replace it with a project-scoped one so this token
+can't touch other packages.
+
+### First release
+
+```bash
+./create_dist.sh
+twine upload --repository syscon_tts dist/*
+```
+
+Use the explicit `--repository` for this one so the right token is selected.
+`--repository` names the `~/.pypirc` section, not the package — the two just
+happen to match here by convention.
+
+### Every release after that
 
 1. Bump `version` in `pyproject.toml` **and** `__version__` in
    `src/syscon_tts/__init__.py`. `tests/test_config.py` fails if they disagree,
    because only `pyproject.toml` drives the published distribution — a drift
    would ship a package whose `--version` contradicts PyPI.
 2. Merge to `main` with CI green.
-3. Tag and push:
+3. Build, upload, and tag:
    ```bash
+   ./create_dist.sh
+   ./upload_dist.sh
    git tag v0.0.2 && git push origin v0.0.2
    ```
 
-[`release.yml`](.github/workflows/release.yml) verifies the tag matches
-`pyproject.toml`, builds an sdist and wheel, runs `twine check`, and uploads.
-It can also be run manually from the Actions tab against **TestPyPI** to
-rehearse a release.
+`create_dist.sh` builds an **sdist and a wheel**, unlike
+`django-search-filter-sort`'s sdist-only script. The wheel is what lets the APU
+install without running a build step or fetching build dependencies — which
+matters on a locked-down or air-gapped host. Both belong on PyPI; pip prefers
+the wheel automatically.
 
-To publish from a local checkout instead — using your `~/.pypirc`:
+### Optional: releasing from CI
 
-```bash
-scripts/release.sh --test          # rehearse against TestPyPI
-scripts/release.sh --build-only    # build and check, upload nothing
-scripts/release.sh                 # the real thing
-```
+[`release.yml`](.github/workflows/release.yml) does the same thing on a tag
+push, plus a check that the tag matches `pyproject.toml`. It needs a
+`PYPI_API_TOKEN` repo secret. It builds from a clean tagged checkout rather than
+your working directory, so the artifact always corresponds to a known commit.
+It can also be dispatched manually against TestPyPI to rehearse.
 
-Prefer the workflow: it builds from a clean tagged checkout rather than your
-working directory, so the artifact always corresponds to a known commit.
+### Caveats
 
-**PyPI versions are immutable.** A bad publish needs a new version number, not
-a re-upload — which is why neither path passes `--skip-existing`. An upload
-that collides with an existing version should fail loudly, since it almost
-always means the version wasn't bumped.
+**PyPI versions are immutable.** A bad publish needs a new version number — you
+cannot re-upload over a released version.
+
+`upload_dist.sh` passes `--skip-existing`, matching the other Syscon package.
+That makes a partially-failed upload safe to retry, but it also means
+forgetting to bump the version fails *silently*. If an upload appears to do
+nothing, check the version on PyPI against `syscon-tts --version`.
 
 ## Branching, commits, and PRs
 
