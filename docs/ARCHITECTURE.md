@@ -6,7 +6,7 @@ Architecture, components, deployment, operations, and interface reference.
 - **Scope:** how it is built and how it runs. For a quick start see
   [README.md](../README.md); for step-by-step deployment recipes see
   [DEPLOY.md](../DEPLOY.md).
-- **Version:** 1.0.0
+- **Version:** 0.0.1
 
 ---
 
@@ -437,7 +437,7 @@ authentication — intended for a trusted local segment. See [§12](#12-performa
 
 ### `GET /`
 ```json
-{"service":"Syscon TTS","version":"1.0.0","engine":"piper",
+{"service":"Syscon TTS","version":"0.0.1","engine":"piper",
  "default_voice":"en_us_amy","endpoints":["/health","/voices","/synthesize"]}
 ```
 

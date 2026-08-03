@@ -94,22 +94,48 @@ If you change the manifest schema itself, update `VoiceProfile` /
 
 ## Releasing
 
+The package is published to PyPI as
+[`syscon-tts`](https://pypi.org/project/syscon-tts/) using an API token, the
+same approach as `django-search-filter-sort`.
+
+**One-time setup:** create a PyPI API token and add it to this repo as the
+`PYPI_API_TOKEN` secret (Settings → Secrets and variables → Actions). Scope it
+to the `syscon-tts` project once that project exists — the first upload needs
+an account-scoped token, which should then be replaced with a project-scoped
+one.
+
+**Each release:**
+
 1. Bump `version` in `pyproject.toml` **and** `__version__` in
-   `src/syscon_tts/__init__.py`.
+   `src/syscon_tts/__init__.py`. `tests/test_config.py` fails if they disagree,
+   because only `pyproject.toml` drives the published distribution — a drift
+   would ship a package whose `--version` contradicts PyPI.
 2. Merge to `main` with CI green.
 3. Tag and push:
    ```bash
-   git tag v1.1.0 && git push origin v1.1.0
+   git tag v0.0.2 && git push origin v0.0.2
    ```
 
 [`release.yml`](.github/workflows/release.yml) verifies the tag matches
-`pyproject.toml`, builds an sdist and wheel, runs `twine check`, and publishes
-to PyPI via Trusted Publishing. There is no API token to manage — but the
-`pypi` GitHub environment and the PyPI-side publisher config must exist first
-(see the comments in that workflow).
+`pyproject.toml`, builds an sdist and wheel, runs `twine check`, and uploads.
+It can also be run manually from the Actions tab against **TestPyPI** to
+rehearse a release.
 
-PyPI versions are immutable: a bad publish needs a new version number, not a
-re-upload. Check the tag before pushing it.
+To publish from a local checkout instead — using your `~/.pypirc`:
+
+```bash
+scripts/release.sh --test          # rehearse against TestPyPI
+scripts/release.sh --build-only    # build and check, upload nothing
+scripts/release.sh                 # the real thing
+```
+
+Prefer the workflow: it builds from a clean tagged checkout rather than your
+working directory, so the artifact always corresponds to a known commit.
+
+**PyPI versions are immutable.** A bad publish needs a new version number, not
+a re-upload — which is why neither path passes `--skip-existing`. An upload
+that collides with an existing version should fail loudly, since it almost
+always means the version wasn't bumped.
 
 ## Branching, commits, and PRs
 

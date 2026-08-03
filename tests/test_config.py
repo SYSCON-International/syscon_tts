@@ -4,6 +4,11 @@ The packaging bug these guard against: paths used to be derived from the source
 tree, which silently breaks once the package is installed into site-packages.
 """
 
+import re
+from pathlib import Path
+
+import pytest
+
 import syscon_tts
 from syscon_tts.config import (
     PACKAGE_DIR,
@@ -87,6 +92,39 @@ def test_default_data_dir_is_absolute():
 
 
 # -- platform gating -------------------------------------------------------
+
+
+def test_declared_version_matches_pyproject():
+    """__init__.__version__ and pyproject's version must agree.
+
+    They are declared in two places, and only pyproject drives the published
+    distribution -- so a drift ships a package whose `--version` disagrees with
+    what PyPI says, and the release workflow's tag check would not catch it.
+    """
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if not pyproject.is_file():  # installed without the source tree
+        pytest.skip("pyproject.toml not available")
+
+    # tomllib is 3.11+; fall back to a narrow regex on older interpreters
+    # rather than taking a dependency just for this check.
+    try:
+        import tomllib
+
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        declared = declared["project"]["version"]
+    except ImportError:
+        match = re.search(
+            r'^version\s*=\s*"([^"]+)"',
+            pyproject.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        assert match, "could not find version in pyproject.toml"
+        declared = match.group(1)
+
+    assert syscon_tts.__version__ == declared, (
+        f"__init__.py says {syscon_tts.__version__} but pyproject.toml says "
+        f"{declared}; bump both together"
+    )
 
 
 def test_package_imports_without_piper():
