@@ -10,7 +10,13 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Dylan Engle", email = "dylane@syscon-intl.com" }]
+# Split across two entries so the metadata renders as separate `Author` and
+# `Author-email` fields, matching django-search-filter-sort. A single entry
+# with both keys would collapse into `Author-email: Name <addr>` instead.
+authors = [
+    { name = "Keith Hostetler" },
+    { email = "robh@syscon-intl.com" },
+]
 keywords = ["tts", "text-to-speech", "piper", "offline", "plantstar", "apu"]
 classifiers = [
     "Development Status :: 3 - Alpha",
