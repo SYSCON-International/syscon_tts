@@ -1,30 +1,39 @@
-# Contributing to PlantStar TTS
+# Contributing to Syscon TTS
 
-Thanks for working on PlantStar TTS. This guide covers local setup, conventions,
-and the workflow for changes. For how the service is built see
+Thanks for working on Syscon TTS. This guide covers local setup, conventions,
+and the workflow for changes. For how the package is built see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); for deployment see
 [DEPLOY.md](DEPLOY.md).
 
 ## Development setup
 
-> **Platform note:** the Piper dependency (`piper-phonemize`) ships wheels only
-> for CPython **3.9–3.11** on Linux x86-64 / aarch64 and macOS x86-64. There is
-> **no macOS arm64 wheel** — on an Apple-Silicon Mac, develop against Docker (see
-> [DEPLOY.md §2b](DEPLOY.md#2b-docker)) rather than a native venv.
-
 ```bash
-python3 --version                     # must be 3.9.x / 3.10.x / 3.11.x
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt   # runtime + test deps
-pip install -e .                      # editable install; provides the `plantstar-tts` CLI
+git clone https://github.com/SYSCON-International/syscon_tts.git
+cd syscon_tts
+python -m venv .venv
+. .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest
 ```
 
-Downloading voice models is only needed to exercise real synthesis locally:
+This works on **Linux, Windows, and macOS**. Piper is platform-gated in
+`pyproject.toml`, so the install never fails on a machine it can't support —
+you simply get a package that can't synthesize. Check which mode you're in:
 
 ```bash
-scripts/download_voices.sh en_us_amy  # one voice is enough for a smoke test
-plantstar-tts speak -v en_us_amy -o /tmp/hi.wav "Hello"
+syscon-tts doctor
 ```
+
+To exercise real synthesis you need Linux with Python 3.9–3.11:
+
+```bash
+syscon-tts download-voices en_us_amy   # one voice is enough for a smoke test
+syscon-tts speak -v en_us_amy -o /tmp/hi.wav "Hello"
+```
+
+On Windows or macOS, generate WAVs on a Linux host, drop them in your
+`SYSCON_TTS_ALERTS_DIR`, and the cache-hit path exercises the full alert
+pipeline locally.
 
 ## Running tests
 
@@ -32,59 +41,96 @@ plantstar-tts speak -v en_us_amy -o /tmp/hi.wav "Hello"
 pytest
 ```
 
-Tests **mock the Piper engine**, so the suite runs without `piper-tts` installed
-or any voice models present. `tests/test_voices.py` covers the voice registry;
-`tests/test_api.py` covers the HTTP endpoints via FastAPI's `TestClient`.
+The suite runs **without Piper and without voice models**, on every platform:
+`test_api.py` mocks the engine, and `test_alerts.py` injects a fake one. Keep it
+that way — a green suite on a developer laptop is the point.
 
-CI runs the same `pytest` on Linux x86-64 for Python 3.9 and 3.11 (see
-[.github/workflows/ci.yml](.github/workflows/ci.yml)). CI installs the **full**
-dependency set, so it also validates that Piper installs on the target platform.
+CI runs the same `pytest` on Linux (3.9, 3.11), Windows, and macOS, and asserts
+that Piper's presence matches what the dependency marker intends for each
+platform. If you change that marker, expect the "Confirm Piper presence" step to
+tell you about it. See [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## Code conventions
 
 - **Keep the interface adapters thin.** All synthesis logic lives in
-  `engine.py`; all voice knowledge lives in `voices.py`. `api.py` and `cli.py`
-  are adapters and should stay that way — new behaviour usually belongs in the
-  core, not an interface.
-- **Configuration is environment variables**, resolved once into `Settings`
-  (`config.py`). Don't read `os.environ` elsewhere; add a field to `Settings`.
-- **src layout.** Package code lives under `src/plantstar_tts/`. Imports use the
-  installed package name (`from plantstar_tts...`), not relative-to-repo paths.
+  `engine.py`; all voice knowledge lives in `voices.py`. `api.py`, `cli.py`, and
+  `alerts.py` are adapters — new behaviour usually belongs in the core.
+- **Only `engine.py` may import Piper, and only inside a function.** This is
+  what makes the package importable on Windows and macOS. A module-level
+  `import piper` anywhere breaks the cross-platform contract.
+- **Never derive runtime paths from the source tree.** Everything resolves
+  through `Settings` (`config.py`). `PACKAGE_DIR` is for bundled package data
+  only — `site-packages` is not a writable data location.
+- **Configuration is environment variables**, resolved once into `Settings`.
+  Don't read `os.environ` elsewhere; add a field to `Settings`.
+- **src layout.** Package code lives under `src/syscon_tts/`. Imports use the
+  installed package name (`from syscon_tts...`).
 - **Match the surrounding style** — module docstrings, type hints, and the
   existing error-type pattern (`VoiceError` / `SynthesisError` subclasses mapped
   to HTTP status codes in `api.py`).
 - Add or update tests for any behaviour change; keep Piper mocked in unit tests.
 
+### Don't break filename parity
+
+`sanitize_file_name()` in `alerts.py` reproduces Django's
+`get_valid_filename(text)[:50]`, which the APU uses to name the same files. If
+the two ever disagree, every lookup becomes a cache miss and the APU serves
+nothing. `tests/test_alerts.py` pins the expected outputs; if you touch that
+function, re-verify against real Django rather than reasoning about the regex.
+
 ## Adding a voice or language
 
 Voices are **data, not code** — no source changes required:
 
-1. Add an entry to [`config/voices.json`](config/voices.json) with a unique `id`
-   and the `model` / `config` filenames plus their `model_url` / `config_url`
-   from [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices).
-2. `scripts/download_voices.sh <new_id>`.
-3. Verify with `plantstar-tts list-voices` (shows `installed: yes`).
+1. Add an entry to [`src/syscon_tts/data/voices.json`](src/syscon_tts/data/voices.json)
+   with a unique `id` and the `model` / `config` filenames plus their
+   `model_url` / `config_url` from
+   [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices).
+2. `syscon-tts download-voices <new_id>`.
+3. Verify with `syscon-tts list-voices` (shows `installed: yes`).
 
 If you change the manifest schema itself, update `VoiceProfile` /
 `VoiceRegistry` in `voices.py` and the tests.
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` **and** `__version__` in
+   `src/syscon_tts/__init__.py`.
+2. Merge to `main` with CI green.
+3. Tag and push:
+   ```bash
+   git tag v1.1.0 && git push origin v1.1.0
+   ```
+
+[`release.yml`](.github/workflows/release.yml) verifies the tag matches
+`pyproject.toml`, builds an sdist and wheel, runs `twine check`, and publishes
+to PyPI via Trusted Publishing. There is no API token to manage — but the
+`pypi` GitHub environment and the PyPI-side publisher config must exist first
+(see the comments in that workflow).
+
+PyPI versions are immutable: a bad publish needs a new version number, not a
+re-upload. Check the tag before pushing it.
 
 ## Branching, commits, and PRs
 
 - Branch off `main`; use a descriptive branch name (e.g. `add-italian-voice`,
   `fix-mp3-error-handling`).
 - Keep commits focused with clear messages (imperative mood, explain the *why*).
-- Open a PR against `main`. CI (tests on 3.9 + 3.11) must pass before merge.
+- Open a PR against `main`. CI must pass on all four matrix entries before merge.
 - Update the relevant docs (`README.md`, `DEPLOY.md`, or
   `docs/ARCHITECTURE.md`) in the same PR when behaviour or interfaces change.
 
 ## Where to make common changes
 
 | Change | File(s) |
-|--------|---------|
-| New/changed API endpoint or field | `src/plantstar_tts/api.py` (+ tests) |
-| New CLI command or flag | `src/plantstar_tts/cli.py` |
-| Synthesis behaviour (speed, formats, caching) | `src/plantstar_tts/engine.py` |
-| Voice lookup / install detection | `src/plantstar_tts/voices.py` |
-| New setting / default | `src/plantstar_tts/config.py` |
-| New voice / language | `config/voices.json` (data only) |
-| Deployment / packaging | `Dockerfile`, `scripts/`, `systemd/`, `pyproject.toml` |
+|---|---|
+| APU integration / caching behaviour | `src/syscon_tts/alerts.py` (+ tests) |
+| Synthesis behaviour (speed, formats, model cache) | `src/syscon_tts/engine.py` |
+| New CLI command or flag | `src/syscon_tts/cli.py` |
+| New/changed API endpoint or field | `src/syscon_tts/api.py` (+ tests) |
+| Voice lookup / install detection | `src/syscon_tts/voices.py` |
+| Model download behaviour | `src/syscon_tts/download.py` |
+| New setting / default | `src/syscon_tts/config.py` |
+| New voice / language | `src/syscon_tts/data/voices.json` (data only) |
+| Dependencies, extras, platform markers | `pyproject.toml` |
+| Deployment / packaging | `scripts/`, `systemd/`, `.github/workflows/` |

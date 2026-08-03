@@ -1,20 +1,23 @@
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
-from plantstar_tts import engine as engine_mod
-from plantstar_tts.api import create_app
-from plantstar_tts.config import Settings
+pytest.importorskip("fastapi", reason="HTTP server is an optional extra")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from fastapi.testclient import TestClient  # noqa: E402
+
+from syscon_tts import engine as engine_mod  # noqa: E402
+from syscon_tts.api import create_app  # noqa: E402
+from syscon_tts.config import Settings, default_manifest_path  # noqa: E402
+from syscon_tts.engine import SynthesisUnavailableError  # noqa: E402
 
 
 @pytest.fixture
-def client():
+def client(tmp_path):
     settings = Settings(
-        voices_manifest=REPO_ROOT / "config" / "voices.json",
-        voices_dir=REPO_ROOT / "voices",
+        voices_manifest=default_manifest_path(),
+        voices_dir=tmp_path / "voices",
+        alerts_dir=tmp_path / "alerts",
         host="127.0.0.1",
         port=5002,
         default_voice="en_us_amy",
@@ -30,6 +33,7 @@ def test_health(client):
     body = r.json()
     assert body["status"] == "ok"
     assert body["voices_total"] >= 6
+    assert "can_synthesize" in body
 
 
 def test_list_voices(client):
@@ -79,3 +83,20 @@ def test_synthesize_uses_default_voice(client, monkeypatch):
     r = client.post("/synthesize", json={"text": "Hi"})
     assert r.status_code == 200
     assert captured["voice_id"] == "en_us_amy"
+
+
+def test_synthesize_without_piper_returns_501(client, monkeypatch):
+    # A host that can never synthesize is distinct from one that is merely
+    # missing models (503) -- clients should not retry the former.
+    def fake_synth(self, text, voice_id, fmt="wav", speed=1.0, sentence_silence=0.2):
+        raise SynthesisUnavailableError("no piper here")
+
+    monkeypatch.setattr(engine_mod.TTSEngine, "synthesize", fake_synth)
+    r = client.post("/synthesize", json={"text": "Hi"})
+    assert r.status_code == 501
+
+
+def test_missing_voice_model_returns_503(client):
+    # voices_dir is an empty tmp dir, so the model genuinely is not installed.
+    r = client.post("/synthesize", json={"text": "Hi", "voice": "en_us_amy"})
+    assert r.status_code in (501, 503)

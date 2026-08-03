@@ -1,5 +1,10 @@
 """HTTP API (FastAPI).
 
+Optional -- install with ``pip install 'syscon-tts[server]'``. The APU does not
+need it: it imports :class:`~syscon_tts.alerts.AlertSynthesizer` in-process, so
+Django never inherits a web-framework dependency it does not use. The server
+exists for local operation and smoke-testing a provisioned host.
+
 Endpoints:
     GET  /health              liveness/readiness probe
     GET  /voices              list available voice profiles
@@ -20,7 +25,12 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings, load_settings
-from .engine import SynthesisError, TTSEngine
+from .engine import (
+    SynthesisError,
+    SynthesisUnavailableError,
+    TTSEngine,
+    piper_available,
+)
 from .voices import UnknownVoiceError, VoiceNotInstalledError, VoiceRegistry
 
 
@@ -38,7 +48,7 @@ class SynthesizeRequest(BaseModel):
     )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or load_settings()
     registry = VoiceRegistry.from_manifest(
         settings.voices_manifest, settings.voices_dir
@@ -46,7 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     engine = TTSEngine(registry)
 
     app = FastAPI(
-        title="PlantStar TTS",
+        title="Syscon TTS",
         version=__version__,
         description="Offline text-to-speech service with selectable voice profiles.",
     )
@@ -57,7 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/")
     def info():
         return {
-            "service": "PlantStar TTS",
+            "service": "Syscon TTS",
             "version": __version__,
             "engine": "piper",
             "default_voice": settings.default_voice,
@@ -69,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         installed = sum(1 for p in registry.all() if registry.is_installed(p))
         return {
             "status": "ok",
+            "can_synthesize": piper_available(),
             "voices_total": len(registry.all()),
             "voices_installed": installed,
         }
@@ -102,6 +113,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except VoiceNotInstalledError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except SynthesisUnavailableError as exc:
+            # 501: this host will never be able to serve the request, as
+            # opposed to 503's "try again once the models are installed".
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
         except SynthesisError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -118,5 +133,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-# Default application instance for `uvicorn plantstar_tts.api:app`.
+# Default application instance for `uvicorn syscon_tts.api:app`.
 app = create_app()

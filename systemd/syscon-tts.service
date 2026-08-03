@@ -1,0 +1,33 @@
+[Unit]
+Description=Syscon TTS (offline text-to-speech service)
+After=network.target
+
+[Service]
+Type=simple
+# Adjust User/paths to match the APU deployment.
+User=plantstar
+WorkingDirectory=/opt/syscon-tts
+
+# Point the service at the APU's media tree so generated alert audio lands
+# where the websocket handler and /media/ serving already look for it.
+Environment=SYSCON_TTS_VOICES_DIR=/opt/plantstar_apu/website/media/tts_voices
+Environment=SYSCON_TTS_ALERTS_DIR=/opt/plantstar_apu/website/media/public_alert_sounds
+Environment=SYSCON_TTS_HOST=127.0.0.1
+Environment=SYSCON_TTS_PORT=5002
+Environment=SYSCON_TTS_DEFAULT_VOICE=en_us_amy
+
+ExecStart=/opt/syscon-tts/.venv/bin/syscon-tts serve
+Restart=on-failure
+RestartSec=3
+
+# Hardening (offline service needs no elevated privileges).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# Models are read from here and generated alert audio is written here, so the
+# media tree must stay writable.
+ReadWritePaths=/opt/plantstar_apu/website/media
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

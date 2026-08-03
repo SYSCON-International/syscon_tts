@@ -1,6 +1,0 @@
-# Core runtime dependencies. Pinned for reproducible offline installs on the APU.
-# piper-tts bundles onnxruntime (CPU) and the phonemizer; no GPU or network
-# needed at runtime once the voice models are downloaded.
-piper-tts==1.2.0
-fastapi==0.111.0
-uvicorn[standard]==0.30.1

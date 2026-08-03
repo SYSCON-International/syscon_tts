@@ -1,5 +1,5 @@
 {
-  "_comment": "Voice profile catalogue. Each entry maps a stable 'id' to a Piper voice model. To add a voice: copy an entry, set a unique id, and set model/config/model_url/config_url from https://huggingface.co/rhasspy/piper-voices then run scripts/download_voices.sh. Quality levels: low (fastest/smallest), medium (balanced), high (best/largest).",
+  "_comment": "Voice profile catalogue. Each entry maps a stable 'id' to a Piper voice model. To add a voice: copy an entry, set a unique id, and set model/config/model_url/config_url from https://huggingface.co/rhasspy/piper-voices then run `syscon-tts download-voices`. Quality levels: low (fastest/smallest), medium (balanced), high (best/largest).",
   "voices": [
     {
       "id": "en_us_amy",

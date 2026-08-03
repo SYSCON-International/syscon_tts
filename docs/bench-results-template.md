@@ -17,7 +17,7 @@ python scripts/benchmark.py                                   # readable table
 |-------|-------|
 | Host / APU id | <e.g. apu-line3-01> |
 | Date | <YYYY-MM-DD> |
-| Deploy method | <bare metal / Docker> |
+| Install method | <pip / air-gapped wheelhouse> |
 | CPU (model, cores) | <e.g. Intel Atom x6425E, 4 cores> |
 | RAM | <e.g. 8 GB> |
 | OS / Python | <e.g. Debian 12 / Python 3.11> |

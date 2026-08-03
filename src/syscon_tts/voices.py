@@ -2,8 +2,13 @@
 
 A voice profile is one selectable voice, backed by a Piper ``.onnx`` model and
 its ``.onnx.json`` config. The catalogue of profiles lives in a JSON manifest
-(``config/voices.json``) so new voices/languages can be added without code
-changes -- add an entry and run ``scripts/download_voices.sh``.
+shipped inside the wheel (``syscon_tts/data/voices.json``) so new
+voices/languages can be added without code changes -- add an entry and run
+``syscon-tts download-voices``. Point ``SYSCON_TTS_MANIFEST`` at your own file
+to override the bundled catalogue entirely.
+
+Reading the manifest never touches the model files, so this module imports and
+works on every platform regardless of whether Piper is installed.
 """
 
 from __future__ import annotations
@@ -33,7 +38,7 @@ class VoiceProfile:
     gender: str
     model: str             # filename of the .onnx model
     config: str            # filename of the .onnx.json config
-    model_url: str = ""    # download source (used by download_voices.sh)
+    model_url: str = ""    # download source (used by `syscon-tts download-voices`)
     config_url: str = ""
 
     def to_public_dict(self, installed: bool) -> dict:

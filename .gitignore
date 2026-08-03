@@ -2,15 +2,23 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
 *.egg-info/
 build/
 dist/
 .pytest_cache/
 
-# Downloaded voice models (fetched via scripts/download_voices.sh; large binaries)
-voices/*.onnx
-voices/*.onnx.json
+# Voice models: large binaries fetched with `syscon-tts download-voices`.
+# They live in a data directory outside the checkout, but ignore any local
+# copy so a stray download can never be committed.
+voices/
+*.onnx
+*.onnx.json
 
 # Generated audio / scratch
 *.wav
 *.mp3
+
+# Editors
+.idea/
+.vscode/

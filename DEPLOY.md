@@ -1,117 +1,152 @@
-# Deploying PlantStar TTS
+# Deploying Syscon TTS
 
-Deployment and validation guide for the offline text-to-speech service.
-The production target is the **PlantStar APU (Linux x86-64)**; the same steps
-work on any Linux box, and the Docker path works on macOS/Windows too.
-
-> **Verified:** the Docker build, dependency install (`piper-tts` +
-> `piper-phonemize` from Linux wheels), server startup, WAV + MP3 synthesis,
-> and all six bundled voices were validated end-to-end on 2026-07-14 (native
-> arm64 Linux container). The APU uses the x86-64 wheel of the same packages.
+Provisioning and validation guide. The production target is the **PlantStar APU
+(Linux x86-64, Python 3.9–3.11)**; the same steps work on any Linux box.
 
 ---
 
-## 1. Pick a deployment path
-
-| Your host | Recommended path |
-|-----------|------------------|
-| APU / any Linux x86-64 with **Python 3.9–3.11** | [Bare metal](#2a-bare-metal-linux-3911) |
-| Any host **without** a suitable Python (incl. macOS/Windows, or Python 3.12+) | [Docker](#2b-docker) |
-
-**Why the Python constraint:** Piper's `piper-phonemize` dependency ships
-prebuilt wheels only for CPython **3.9, 3.10, 3.11**. There is **no macOS
-Apple-Silicon (arm64) wheel at all** — on an M-series Mac you must use Docker.
-Linux x86-64 and aarch64 both have wheels, so the APU is fully supported.
-
----
-
-## 2a. Bare metal (Linux, Python 3.9–3.11)
+## 1. Install
 
 ```bash
 # Confirm the interpreter is in range first:
 python3 --version            # must be 3.9.x / 3.10.x / 3.11.x
 
-cd plantstar-tts
-scripts/install.sh           # creates .venv, installs deps, downloads all 6 voices
-source .venv/bin/activate
-plantstar-tts serve --port 5002
+pip install syscon-tts
+syscon-tts download-voices   # one-time, needs internet
+syscon-tts doctor            # must report "Ready."
 ```
 
-`scripts/install.sh` needs internet **once** (for pip + voice models). For an
-air-gapped APU, see [§5](#5-air-gapped-installs).
+`doctor` is the gate. It exits non-zero and explains the problem if Piper is
+missing on a Linux host or no models are on disk. Wire it into provisioning
+rather than discovering a broken TTS at the first alert.
 
-Run it as a managed service with the provided unit — see [§4](#4-run-as-a-systemd-service).
+**Why the Python constraint:** Piper's `piper-phonemize` dependency ships
+prebuilt wheels only for CPython **3.9, 3.10, 3.11**, and only for Linux. On
+Python 3.12+ or on Windows/macOS the dependency marker skips it and the install
+still succeeds — you get a package that can replay cached audio but not
+generate it. See [README.md](README.md#platform-support).
+
+### Where the models go
+
+By default, models land in `/var/lib/syscon-tts/voices` (or
+`~/.local/share/syscon-tts/voices` if that is not writable). On an APU, point
+them at the Django media tree instead so generated audio is served by the
+existing `/media/` route:
+
+```bash
+export SYSCON_TTS_VOICES_DIR=<MEDIA_ROOT>/tts_voices
+export SYSCON_TTS_ALERTS_DIR=<MEDIA_ROOT>/public_alert_sounds
+syscon-tts download-voices
+```
+
+`MEDIA_ROOT` is `website/media/`, which is already gitignored — so the ~360 MB
+of models never enter the source tree, and they sit beside the
+`public_alert_sounds/` directory they feed.
 
 ---
 
-## 2b. Docker
+## 2. Replace `call_tts()` in the APU
 
-Requires Docker Engine / Docker Desktop.
+The APU's current implementation shells out to the proprietary VoiceText binary
+(`PublicAddressWebSocketHandler.call_tts`):
 
-```bash
-cd plantstar-tts
-
-# 1. Fetch voice models on a networked machine (models are mounted, not baked in):
-scripts/download_voices.sh                 # all 6 voices
-#   or a subset:  scripts/download_voices.sh en_us_amy en_us_ryan
-
-# 2. Build the image (Python 3.11 is pinned inside the Dockerfile):
-docker build -t plantstar-tts .
-
-# 3. Run, mounting the voices directory:
-docker run -d --name plantstar-tts -p 5002:5002 \
-  -v "$PWD/voices:/app/voices" plantstar-tts
+```python
+def call_tts(self, message, file_name):
+    message = message.replace("\"", "")
+    subprocess.run([
+        "/usr/vt/sample/ttssample", "8", str(self.tts_server_ip),
+        str(self.tts_server_port), str(message), str(len(message)),
+        "public_alert_sounds", str(file_name), self.tts_voice_name, str(0)
+    ])
+    self.open_files.append(file_name)
 ```
 
-Lifecycle:
+Everything downstream — the websocket push, `/media/` serving,
+`check_for_file_delete` — only cares that
+`MEDIA_ROOT/public_alert_sounds/<file_name>.wav` exists. So this method is the
+entire integration surface:
 
-```bash
-docker stop plantstar-tts       # stop (keeps the container + image)
-docker start plantstar-tts      # restart it
-docker logs -f plantstar-tts    # follow logs
-docker rm -f plantstar-tts      # remove the container (models on host are kept)
+```python
+from pathlib import Path
+from django.conf import settings
+from syscon_tts import AlertSynthesizer, SynthesisUnavailableError
+
+# Module level, not per call: the instance caches loaded voice models, and
+# rebuilding it per alert reintroduces a multi-second cold load every time.
+_synthesizer = AlertSynthesizer()
+
+def call_tts(self, message, file_name):
+    message = message.replace('"', "")
+    try:
+        _synthesizer.ensure(
+            message,
+            file_name=file_name,
+            voice=self.tts_voice_name,
+            alerts_dir=Path(settings.MEDIA_ROOT, "public_alert_sounds"),
+        )
+    except SynthesisUnavailableError:
+        # Development machine without Piper. Any previously generated WAV is
+        # still returned by ensure(); this branch means there was none.
+        logger.warning("TTS unavailable on this host for %r", file_name)
+        raise
+    self.open_files.append(file_name)
 ```
 
-> On Apple Silicon, Docker builds a native **arm64** image (fast). To rehearse
-> the exact x86-64 APU build instead, add `--platform linux/amd64` to
-> `docker build` / `docker run` — it runs under emulation and is slower.
+Pass `file_name` explicitly so the APU stays the single source of truth for
+naming. The package computes the same value independently
+(`get_valid_filename(text)[:50]`, verified byte-for-byte against Django), but
+there is no reason to have two authorities.
+
+### Voice IDs
+
+The APU addresses voices by numeric `TTS_VOICE_ID` (default `100` =
+`ENGLISH_FEMALE_KATE` → `"kate"`), mapped in
+`base_app/global_definitions.py`. This package uses string ids like
+`en_us_amy`. The two catalogues share no names, so you need a mapping.
+
+Note the shape of the gap before writing one: the APU catalogue is Korean
+(3–21), English (100–106), Chinese (200–205), and Japanese (300–307), while
+this package ships en/es/fr/de. **Only the English block maps at all**, and the
+four English female voices collapse onto `en_us_amy`. Adding Korean, Chinese,
+and Japanese voices to the manifest from
+<https://huggingface.co/rhasspy/piper-voices> is the way to close it.
+
+### The `IS_LIVE` gate
+
+`call_tts` is wrapped in `if settings.IS_LIVE:`, and development boxes set
+`IS_LIVE = False`. **Do not flip it to test locally.** The same flag gates
+`chown`/`chmod` calls that are Linux-only, plus module-level hardware imports
+in the device-interface layer; flipping it breaks unrelated subsystems on
+Windows. Test the synthesis path directly instead:
+
+```bash
+syscon-tts alert "Press 4 cavity pressure exceeded." \
+  --alerts-dir <MEDIA_ROOT>/public_alert_sounds
+```
 
 ---
 
-## 3. Validate the deployment
-
-Run these against the running service. **Step 3 is the real proof** — it must
-produce a playable audio file.
+## 3. Validate
 
 ```bash
-# 1. Up, and how many voices are installed?
-curl -s http://localhost:5002/health
-#    expect: {"status":"ok","voices_total":6,"voices_installed":6}
+syscon-tts doctor          # expect "Ready."
+syscon-tts list-voices     # all six should show installed: yes
 
-# 2. List voices
-curl -s http://localhost:5002/voices | python3 -m json.tool
+# Generate a real file and confirm it plays.
+syscon-tts speak -v en_us_ryan -o test.wav \
+  "Machine four cycle complete. Cavity pressure nominal."
+file test.wav              # -> RIFF ... WAVE audio, 16 bit, mono 22050 Hz
+ls -l test.wav             # tens-to-hundreds of KB, not 0
+aplay test.wav
 
-# 3. Generate audio
-curl -s -X POST http://localhost:5002/synthesize \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"Machine four cycle complete. Cavity pressure nominal.","voice":"en_us_ryan"}' \
-  -o test.wav
-
-# 4. Confirm it is a real, non-empty WAV
-file test.wav        # -> RIFF ... WAVE audio, 16 bit, mono 22050 Hz
-ls -l test.wav       # tens-to-hundreds of KB, not 0
-aplay test.wav       # Linux; on macOS use: afplay test.wav
+# Exercise the APU code path (cache first, then synthesis).
+syscon-tts alert "Press 4 cavity pressure exceeded."
+syscon-tts alert "Press 4 cavity pressure exceeded."   # -> [cached]
 ```
 
-CLI path (bare metal):
-
-```bash
-plantstar-tts list-voices
-plantstar-tts speak -v de_de_thorsten -o ansage.wav "Maschine vier Zyklus abgeschlossen."
-```
-
-If `voices_installed` is `0`, the models are not where the service expects them
-(`voices/`, or the mounted volume in Docker); synthesis will then return `503`.
+If `doctor` reports `voices installed 0/6`, the models are not where the
+service expects; check `SYSCON_TTS_VOICES_DIR`. Synthesis then fails with a
+`VoiceNotInstalledError` (HTTP `503`).
 
 **Language note:** the Spanish/French/German voices are language-specific
 models. Send them text *in their own language* — feeding English to a German
@@ -119,32 +154,47 @@ voice produces poor pronunciation.
 
 ---
 
-## 4. Run as a systemd service
+## 4. Run as a systemd service (optional)
 
-See [`systemd/plantstar-tts.service`](systemd/plantstar-tts.service). Deploy the
-app to `/opt/plantstar-tts`, adjust `User`/paths, then:
+Only needed if you want the HTTP server. The APU itself does not — it imports
+the library in-process.
+
+See [`systemd/syscon-tts.service`](systemd/syscon-tts.service). Install into
+`/opt/syscon-tts`, adjust `User` and the two path variables, then:
 
 ```bash
-sudo cp systemd/plantstar-tts.service /etc/systemd/system/
+sudo cp systemd/syscon-tts.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now plantstar-tts
-systemctl status plantstar-tts
+sudo systemctl enable --now syscon-tts
+systemctl status syscon-tts
 ```
+
+The unit binds `127.0.0.1` by default. Change `SYSCON_TTS_HOST` only if
+something off-box genuinely needs to reach it.
 
 ---
 
 ## 5. Air-gapped installs
 
-The service runs fully offline; only model download needs the internet.
+Everything runs offline; only the model download needs internet.
 
-1. On any networked machine: `scripts/download_voices.sh`
-2. Copy the resulting `voices/` directory onto the APU (same repo location, or
-   point `PLANTSTAR_TTS_VOICES_DIR` at it).
-3. For bare metal, also pre-stage pip dependencies (e.g. `pip download -r
-   requirements.txt -d wheelhouse` on a matching Linux x86-64 / Python 3.9–3.11
-   host, copy `wheelhouse/`, then `pip install --no-index --find-links wheelhouse -e .`).
-   For Docker, `docker save plantstar-tts | gzip > image.tgz`, copy it, and
-   `docker load < image.tgz` on the APU.
+1. On a networked machine with a **matching Linux x86-64 / Python 3.9–3.11**
+   environment:
+   ```bash
+   pip download syscon-tts -d wheelhouse
+   SYSCON_TTS_VOICES_DIR=./voices syscon-tts download-voices
+   ```
+2. Copy `wheelhouse/` and `voices/` to the APU.
+3. Install from the local copies:
+   ```bash
+   pip install --no-index --find-links wheelhouse syscon-tts
+   export SYSCON_TTS_VOICES_DIR=<MEDIA_ROOT>/tts_voices
+   cp voices/* "$SYSCON_TTS_VOICES_DIR/"
+   syscon-tts doctor
+   ```
+
+`pip download` must run on a host matching the APU's platform and interpreter,
+or it will fetch wheels Piper cannot use.
 
 ---
 
@@ -154,42 +204,34 @@ Voices come in quality tiers: **low** (fastest, smallest), **medium**
 (default, balanced), **high** (best, largest). Piper is CPU-only; on a weak APU
 CPU, `medium` may synthesize slower than you want.
 
-To make a voice faster, switch it to its `low` model in
-[`config/voices.json`](config/voices.json) — change the `medium` occurrences in
-that voice's `model`, `config`, `model_url`, and `config_url` to `low`, e.g.:
+To make a voice faster, copy the bundled manifest, switch that voice to its
+`low` model, and point `SYSCON_TTS_MANIFEST` at your copy — change the `medium`
+occurrences in the voice's `model`, `config`, `model_url`, and `config_url`:
 
 ```
 en_US-amy-medium.onnx   ->  en_US-amy-low.onnx
-.../amy/medium/...       ->  .../amy/low/...
+.../amy/medium/...      ->  .../amy/low/...
 ```
 
-Then re-download that voice (`scripts/download_voices.sh en_us_amy`) and
-restart the service. Not every voice publishes a `low` tier — check the voice's
-folder at <https://huggingface.co/rhasspy/piper-voices>.
+Then `syscon-tts download-voices en_us_amy` and restart. Not every voice
+publishes a `low` tier — check the voice's folder at
+<https://huggingface.co/rhasspy/piper-voices>.
 
 Rule of thumb on APU-class CPUs: `medium` runs a few times faster than
 real-time; `low` is faster still with a modest quality drop. Measure on the
-actual hardware before committing to a tier — use the benchmark below.
+actual hardware before committing.
 
-### Benchmarking on the APU (post-deployment)
+### Benchmarking (post-deployment)
 
 `scripts/benchmark.py` measures real synthesis performance on the host it runs
-on. Run it **on the APU after deployment** so the numbers reflect the real CPU.
-For each installed voice it reports cold model-load time, resident-memory
-growth, and the **real-time factor (RTF = synth_time ÷ audio_seconds)** plus
-latency for short/medium/long messages.
+on. Run it **on the APU after deployment**. For each installed voice it reports
+cold model-load time, resident-memory growth, and the **real-time factor
+(RTF = synth_time ÷ audio_seconds)** plus latency for short/medium/long
+messages.
 
 ```bash
-# Bare metal
-source .venv/bin/activate
 python scripts/benchmark.py                 # all installed voices
 python scripts/benchmark.py en_us_amy --runs 5
-
-# Docker (copy the script into the running container, then exec)
-docker cp scripts/benchmark.py plantstar-tts:/app/benchmark.py
-docker exec plantstar-tts python /app/benchmark.py
-
-# Archive results per host for comparison
 python scripts/benchmark.py --json > "bench-$(hostname).json"
 ```
 
@@ -211,17 +253,21 @@ Interpreting it:
 - **MEM** is the RSS added by loading that voice; sum the voices you expect to
   keep loaded to size the process.
 - **COLD LOAD** is paid once per voice on first use, then amortized (voices stay
-  cached). Preload critical voices at startup if first-hit latency matters.
+  cached in the `AlertSynthesizer`). This is why the APU should hold one
+  instance rather than building one per alert.
+
+Record results with [docs/bench-results-template.md](docs/bench-results-template.md).
 
 ---
 
 ## 7. Configuration reference
 
-All settings are environment variables (see the table in
-[README.md](README.md#configuration-environment-variables)). The most common:
+Full table in [README.md](README.md#configuration). The ones that matter on an
+APU:
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `PLANTSTAR_TTS_PORT` | `5002` | API bind port |
-| `PLANTSTAR_TTS_DEFAULT_VOICE` | `en_us_amy` | Voice used when none is requested |
-| `PLANTSTAR_TTS_VOICES_DIR` | `voices/` | Where the `.onnx` models live |
+|---|---|---|
+| `SYSCON_TTS_VOICES_DIR` | platform data dir | Where the `.onnx` models live |
+| `SYSCON_TTS_ALERTS_DIR` | platform data dir | Where alert WAVs are written |
+| `SYSCON_TTS_DEFAULT_VOICE` | `en_us_amy` | Voice used when none is requested |
+| `SYSCON_TTS_MANIFEST` | bundled | Override the voice catalogue |

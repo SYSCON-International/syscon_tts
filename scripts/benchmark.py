@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Benchmark PlantStar TTS synthesis on the current host (e.g. the APU).
+"""Benchmark Syscon TTS synthesis on the current host (e.g. the APU).
 
 Run this AFTER deployment, inside the environment where the service runs, so
-the numbers reflect the real hardware:
+the numbers reflect the real hardware. Requires Piper, so it only runs on
+Linux:
 
-    # bare metal
-    source .venv/bin/activate
+    source /opt/syscon-tts/.venv/bin/activate
     python scripts/benchmark.py
-
-    # Docker (copy the script in first, then exec)
-    docker cp scripts/benchmark.py plantstar-tts:/app/benchmark.py
-    docker exec plantstar-tts python /app/benchmark.py
 
 For each installed voice it measures:
   * cold load  - time to load the model into memory (first use)
@@ -40,9 +36,9 @@ from pathlib import Path
 # Allow running straight from a checkout without `pip install`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from plantstar_tts.config import load_settings  # noqa: E402
-from plantstar_tts.engine import TTSEngine  # noqa: E402
-from plantstar_tts.voices import VoiceRegistry  # noqa: E402
+from syscon_tts.config import load_settings  # noqa: E402
+from syscon_tts.engine import TTSEngine  # noqa: E402
+from syscon_tts.voices import VoiceRegistry  # noqa: E402
 
 # Representative message lengths. Timing (RTF) is language-agnostic, so a single
 # English set keeps results directly comparable across all voices.
@@ -114,7 +110,7 @@ def benchmark_voice(engine: TTSEngine, voice_id: str, runs: int) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Benchmark PlantStar TTS synthesis.")
+    parser = argparse.ArgumentParser(description="Benchmark Syscon TTS synthesis.")
     parser.add_argument("voices", nargs="*", help="Voice ids (default: all installed).")
     parser.add_argument("--runs", type=int, default=3,
                         help="Warm runs per sample; the fastest is reported (default 3).")
@@ -131,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         requested = [v.id for v in registry.all() if registry.is_installed(v)]
 
     if not requested:
-        print("No installed voices to benchmark. Run scripts/download_voices.sh first.",
+        print("No installed voices to benchmark. Run 'syscon-tts download-voices' first.",
               file=sys.stderr)
         return 1
 
@@ -149,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Human-readable table.
-    print(f"\nPlantStar TTS benchmark  (platform={sys.platform}, "
+    print(f"\nSyscon TTS benchmark  (platform={sys.platform}, "
           f"best of {args.runs} runs)\n")
     header = (f"{'VOICE':<16} {'COLD LOAD':>9} {'MEM':>7}  "
               f"{'SHORT RTF':>9} {'MED RTF':>8} {'LONG RTF':>9}  {'LONG LAT':>8}")

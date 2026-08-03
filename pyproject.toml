@@ -1,24 +1,69 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "plantstar-tts"
+name = "syscon-tts"
 version = "1.0.0"
-description = "Offline text-to-speech service for the PlantStar APU server"
+description = "Offline neural text-to-speech for the PlantStar APU"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-    "piper-tts==1.2.0",
-    "fastapi==0.111.0",
-    "uvicorn[standard]==0.30.1",
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Syscon International" }]
+keywords = ["tts", "text-to-speech", "piper", "offline", "plantstar", "apu"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Manufacturing",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 
+# Piper ships Linux-only binary wheels (piper-phonemize has no Windows or
+# macOS distribution, and none for Python 3.12+). The marker keeps
+# `pip install syscon-tts` working everywhere: Linux hosts get a synthesis
+# engine, other platforms get a package that can still resolve, inspect, and
+# replay previously generated audio. Run `syscon-tts doctor` after installing
+# to confirm which mode you landed in.
+dependencies = [
+    "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12'",
+]
+
+[project.optional-dependencies]
+# Force the synthesis engine regardless of the marker above. Fails loudly on a
+# platform Piper cannot support, which is what you want when the install is
+# meant to produce audio.
+piper = ["piper-tts==1.2.0"]
+# The optional HTTP server. Not needed by the APU, which imports the library.
+server = ["fastapi>=0.111,<1.0", "uvicorn[standard]>=0.30,<1.0"]
+dev = [
+    "pytest>=8.2,<9",
+    "httpx>=0.27,<1.0",
+    "fastapi>=0.111,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/SYSCON-International/syscon_tts"
+Source = "https://github.com/SYSCON-International/syscon_tts"
+Issues = "https://github.com/SYSCON-International/syscon_tts/issues"
+
 [project.scripts]
-plantstar-tts = "plantstar_tts.cli:main"
+syscon-tts = "syscon_tts.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The voice manifest travels inside the wheel; the models it points at are
+# downloaded at provisioning time (they are far too large to ship).
+syscon_tts = ["data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

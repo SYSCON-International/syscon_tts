@@ -3,14 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from plantstar_tts.voices import (
+from syscon_tts.config import default_manifest_path
+from syscon_tts.voices import (
     UnknownVoiceError,
     VoiceError,
     VoiceRegistry,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-REAL_MANIFEST = REPO_ROOT / "config" / "voices.json"
 
 
 def _write_manifest(tmp_path: Path) -> Path:
@@ -31,14 +29,23 @@ def _write_manifest(tmp_path: Path) -> Path:
     return p
 
 
-def test_bundled_manifest_is_valid():
-    reg = VoiceRegistry.from_manifest(REAL_MANIFEST, REPO_ROOT / "voices")
+def test_bundled_manifest_ships_with_the_package(tmp_path):
+    # The manifest must resolve from package data, not the source tree, or the
+    # installed wheel breaks on import.
+    assert default_manifest_path().is_file()
+    reg = VoiceRegistry.from_manifest(default_manifest_path(), tmp_path)
     ids = {v.id for v in reg.all()}
     assert "en_us_amy" in ids
     assert len(reg.all()) >= 6
-    # Every bundled voice should span more than one language.
     langs = {v.language for v in reg.all()}
     assert len(langs) >= 3
+
+
+def test_bundled_manifest_entries_have_download_urls():
+    reg = VoiceRegistry.from_manifest(default_manifest_path(), Path("."))
+    for profile in reg.all():
+        assert profile.model_url, f"{profile.id} has no model_url"
+        assert profile.config_url, f"{profile.id} has no config_url"
 
 
 def test_get_unknown_voice_raises(tmp_path):
