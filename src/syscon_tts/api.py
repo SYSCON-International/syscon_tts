@@ -24,6 +24,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .alerts import resolve_voice_id
 from .config import Settings, load_settings
 from .engine import (
     SynthesisError,
@@ -39,6 +40,13 @@ class SynthesizeRequest(BaseModel):
     voice: Optional[str] = Field(
         None, description="Voice id. Defaults to the server's default voice."
     )
+    language: Optional[str] = Field(
+        None,
+        description=(
+            "Locale to pick a voice for (es-mx, zh-hans) when 'voice' is not "
+            "given. Falls back to the default voice if nothing matches."
+        ),
+    )
     format: str = Field("wav", description="Output format: 'wav' or 'mp3'.")
     speed: float = Field(
         1.0, gt=0, le=4.0, description="Speed multiplier (1.0 = normal)."
@@ -50,10 +58,8 @@ class SynthesizeRequest(BaseModel):
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or load_settings()
-    registry = VoiceRegistry.from_manifest(
-        settings.voices_manifest, settings.voices_dir
-    )
-    engine = TTSEngine(registry)
+    registry = VoiceRegistry.from_settings(settings)
+    engine = TTSEngine(registry, settings.max_loaded_voices)
 
     app = FastAPI(
         title="Syscon TTS",
@@ -85,11 +91,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
     @app.get("/voices")
-    def list_voices():
+    def list_voices(language: Optional[str] = None):
+        profiles = registry.for_language(language) if language else registry.all()
         return {
             "default": settings.default_voice,
+            "defaults_by_language": dict(settings.default_voices),
             "voices": [
-                p.to_public_dict(registry.is_installed(p)) for p in registry.all()
+                p.to_public_dict(registry.is_installed(p)) for p in profiles
             ],
         }
 
@@ -100,7 +108,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_code=413,
                 detail=f"Text exceeds max length of {settings.max_text_chars} chars.",
             )
-        voice_id = req.voice or settings.default_voice
+        voice_id = resolve_voice_id(registry, settings, req.voice, req.language)
         try:
             audio, media_type = engine.synthesize(
                 req.text,

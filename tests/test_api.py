@@ -20,7 +20,7 @@ def client(tmp_path):
         alerts_dir=tmp_path / "alerts",
         host="127.0.0.1",
         port=5002,
-        default_voice="en_us_amy",
+        default_voice="en_us_kristin",
         max_text_chars=100,
     )
     app = create_app(settings)
@@ -40,9 +40,9 @@ def test_list_voices(client):
     r = client.get("/voices")
     assert r.status_code == 200
     body = r.json()
-    assert body["default"] == "en_us_amy"
+    assert body["default"] == "en_us_kristin"
     ids = {v["id"] for v in body["voices"]}
-    assert "en_us_amy" in ids
+    assert "en_us_kristin" in ids
     assert all("installed" in v for v in body["voices"])
 
 
@@ -50,14 +50,14 @@ def test_synthesize_success(client, monkeypatch):
     # Avoid loading the real Piper model; return fake audio bytes.
     def fake_synth(self, text, voice_id, fmt="wav", speed=1.0, sentence_silence=0.2):
         assert text == "Hello"
-        assert voice_id == "en_us_amy"
+        assert voice_id == "en_us_kristin"
         return b"RIFFfakewavdata", "audio/wav"
 
     monkeypatch.setattr(engine_mod.TTSEngine, "synthesize", fake_synth)
-    r = client.post("/synthesize", json={"text": "Hello", "voice": "en_us_amy"})
+    r = client.post("/synthesize", json={"text": "Hello", "voice": "en_us_kristin"})
     assert r.status_code == 200
     assert r.headers["content-type"] == "audio/wav"
-    assert r.headers["x-voice"] == "en_us_amy"
+    assert r.headers["x-voice"] == "en_us_kristin"
     assert r.content == b"RIFFfakewavdata"
 
 
@@ -82,7 +82,7 @@ def test_synthesize_uses_default_voice(client, monkeypatch):
     monkeypatch.setattr(engine_mod.TTSEngine, "synthesize", fake_synth)
     r = client.post("/synthesize", json={"text": "Hi"})
     assert r.status_code == 200
-    assert captured["voice_id"] == "en_us_amy"
+    assert captured["voice_id"] == "en_us_kristin"
 
 
 def test_synthesize_without_piper_returns_501(client, monkeypatch):
@@ -98,5 +98,5 @@ def test_synthesize_without_piper_returns_501(client, monkeypatch):
 
 def test_missing_voice_model_returns_503(client):
     # voices_dir is an empty tmp dir, so the model genuinely is not installed.
-    r = client.post("/synthesize", json={"text": "Hi", "voice": "en_us_amy"})
+    r = client.post("/synthesize", json={"text": "Hi", "voice": "en_us_kristin"})
     assert r.status_code in (501, 503)

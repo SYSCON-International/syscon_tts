@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .voices import VoiceProfile, VoiceRegistry
+from .voices import VoiceProfile, VoiceRegistry, normalize_language
 
 #: Downloads are large (~60 MB per model); allow a generous connect timeout.
 DEFAULT_TIMEOUT = 60
@@ -26,6 +26,15 @@ DEFAULT_TIMEOUT = 60
 
 class DownloadError(Exception):
     """A voice asset could not be retrieved."""
+
+
+class LicenseReviewRequired(DownloadError):
+    """Refused to fetch a voice whose license does not clear commercial use.
+
+    Not a hard block -- pass ``accept_license=True`` (``--accept-license`` on
+    the command line) once somebody has actually reviewed it. The point is that
+    the decision is made by a person, not by a default.
+    """
 
 
 @dataclass
@@ -107,16 +116,71 @@ def download_voices(
     voice_ids: Optional[Iterable[str]] = None,
     force: bool = False,
     on_progress: Optional[Callable[[str], None]] = None,
+    language: Optional[str] = None,
+    accept_license: bool = False,
 ) -> list[DownloadResult]:
-    """Fetch every requested voice (all of them when ``voice_ids`` is empty).
+    """Fetch the requested voices (the whole catalogue when nothing is named).
 
-    Unknown ids raise before any download starts, so a typo does not leave a
-    half-populated voices directory.
+    ``language`` narrows the catalogue to one locale, which is how a site
+    provisions only what it will actually announce in instead of pulling every
+    model. Unknown ids raise before any download starts, so a typo does not
+    leave a half-populated voices directory.
+
+    Voices needing a license review are refused when named explicitly and
+    skipped (with a note) during a bulk download, unless ``accept_license``
+    says somebody has cleared them.
     """
-    if voice_ids:
+    explicit = bool(voice_ids)
+    if explicit:
         profiles = [registry.get(vid) for vid in voice_ids]
+        blocked = [p for p in profiles if p.requires_license_review]
+        if blocked and not accept_license:
+            listing = "; ".join(
+                f"{p.id} (license: {p.license}{', ' + p.license_url if p.license_url else ''})"
+                for p in blocked
+            )
+            raise LicenseReviewRequired(
+                f"Refusing to download {listing}. PlantStar ships to paying "
+                "customers, and this voice's license does not clearly permit "
+                "that. Re-run with --accept-license once it has been reviewed."
+            )
     else:
         profiles = registry.all()
+        if language:
+            matches = registry.for_language(language)
+            # Exact locale only when there is one: a site asking for es-MX
+            # should not also pull 60 MB of Castilian it will never play. If
+            # nothing matches exactly, the related-language voices are the
+            # only way that site gets audio at all, so fetch those.
+            wanted = normalize_language(language)
+            profiles = [p for p in matches if p.language == wanted] or matches
+            if not profiles:
+                raise DownloadError(
+                    f"No voice in the catalogue for language '{language}'. "
+                    f"Known languages: {', '.join(registry.languages())}."
+                )
+        skipped = []
+        if not accept_license:
+            skipped = [p for p in profiles if p.requires_license_review]
+            profiles = [p for p in profiles if not p.requires_license_review]
+        for profile in skipped:
+            if on_progress:
+                on_progress(
+                    f"  skip {profile.id} (license: {profile.license}; "
+                    "name it explicitly with --accept-license to fetch it)"
+                )
+
+        # Voices discovered on disk have no download URL -- they are already
+        # here by definition, and a bulk download must not fail over them. A
+        # voice named explicitly still errors, because the caller asked for
+        # something this package cannot do.
+        without_urls = [p for p in profiles if not (p.model_url and p.config_url)]
+        profiles = [p for p in profiles if p.model_url and p.config_url]
+        for profile in without_urls:
+            if on_progress:
+                on_progress(
+                    f"  skip {profile.id} (no download URL; supplied on disk)"
+                )
 
     results: list[DownloadResult] = []
     for profile in profiles:

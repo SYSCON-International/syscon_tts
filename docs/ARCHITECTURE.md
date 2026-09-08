@@ -6,7 +6,7 @@ Architecture, components, deployment, operations, and interface reference.
 - **Scope:** how it is built and how it runs. For a quick start see
   [README.md](../README.md); for step-by-step deployment recipes see
   [DEPLOY.md](../DEPLOY.md).
-- **Version:** 0.0.1
+- **Version:** 0.0.2
 
 ---
 
@@ -33,9 +33,9 @@ network access** and **no GPU** — inference runs on CPU via ONNX Runtime.
 | CPU-only (no GPU on APU) | Piper uses `onnxruntime` CPU inference |
 | Installs on developer machines too | Piper is platform-gated; the package degrades to replay-only rather than failing to install |
 | Never degrade the APU's Django process | No web deps in the base install; the library is imported directly |
-| Multiple selectable voices / languages | JSON voice manifest + per-call voice selection |
-| Easy to extend with new voices | Add a manifest entry + download; no code change |
-| Predictable footprint | Voices lazy-load and are cached in the synthesizer instance |
+| Multiple selectable voices / languages | JSON voice manifest + per-call voice or locale selection |
+| Easy to extend with new voices | Add a manifest entry, layer an overlay manifest, or drop model files in the voices directory; no code change |
+| Predictable footprint | Voices lazy-load into a bounded LRU cache (default 3 resident) |
 
 ---
 
@@ -53,10 +53,10 @@ flowchart TD
         ALERTS["alerts.py<br/>AlertSynthesizer<br/>(cache-first resolution)"]
         CLI["cli.py<br/>argparse<br/>(doctor / download / speak / alert / serve)"]
         API["api.py<br/>FastAPI app — optional extra<br/>(/health /voices /synthesize)"]
-        ENGINE["engine.py<br/>TTSEngine<br/>(lazy load + in-memory cache)"]
+        ENGINE["engine.py<br/>TTSEngine<br/>(lazy load + bounded LRU cache)"]
         REG["voices.py<br/>VoiceRegistry / VoiceProfile"]
         DL["download.py<br/>model fetcher"]
-        CFG["config.py<br/>Settings (env-driven)"]
+        CFG["config.py<br/>Settings (env vars + keyword overrides)"]
     end
 
     subgraph Data["On-disk data"]
@@ -93,11 +93,11 @@ flowchart TD
 
 | Component | File | Responsibility |
 |---|---|---|
-| **Config** | `src/syscon_tts/config.py` | Resolve settings from environment variables into a `Settings` dataclass. Single source of paths, host/port, default voice, limits. Nothing is derived from the source tree. |
-| **Voice registry** | `src/syscon_tts/voices.py` | Load the manifest into `VoiceProfile` objects; look up voices by id; report whether a voice's model files are on disk. Defines the voice-error types. |
-| **Engine** | `src/syscon_tts/engine.py` | `TTSEngine` — lazy-loads Piper models, caches them in memory (thread-safe), renders text to WAV, optionally transcodes to MP3. **The only component that imports Piper.** |
-| **Alerts** | `src/syscon_tts/alerts.py` | `AlertSynthesizer` — cache-first resolution of alert text to a WAV on disk. Reproduces Django's `get_valid_filename` so paths match the APU's. The APU's integration point. |
-| **Downloader** | `src/syscon_tts/download.py` | Fetch models from HuggingFace with atomic writes. Pure stdlib `urllib`, so it works on every platform. |
+| **Config** | `src/syscon_tts/config.py` | Resolve settings from environment variables *and* keyword overrides into a `Settings` dataclass. Single source of paths, host/port, default voices, file modes, limits. Nothing is derived from the source tree. |
+| **Voice registry** | `src/syscon_tts/voices.py` | Load the manifest (plus an optional overlay, plus models discovered on disk) into `VoiceProfile` objects; look up voices by id or locale; report install state and license status. Defines the voice-error types. |
+| **Engine** | `src/syscon_tts/engine.py` | `TTSEngine` — lazy-loads Piper models, keeps a bounded LRU cache of them, serializes synthesis per voice, renders text to WAV, optionally transcodes to MP3. **The only component that imports Piper.** |
+| **Alerts** | `src/syscon_tts/alerts.py` | `AlertSynthesizer` — cache-first resolution of alert text to a WAV on disk, with voice selection by locale. Reproduces Django's `get_valid_filename` so paths match the APU's. The APU's integration point. |
+| **Downloader** | `src/syscon_tts/download.py` | Fetch models from HuggingFace with atomic writes; filter by language and refuse voices whose license is not cleared for commercial use. Pure stdlib `urllib`, so it works on every platform. |
 | **CLI** | `src/syscon_tts/cli.py` | `argparse` front-end: `doctor`, `download-voices`, `list-voices`, `speak`, `alert`, `serve`. |
 | **HTTP API** | `src/syscon_tts/api.py` | Optional FastAPI app exposing `/`, `/health`, `/voices`, `/synthesize`; maps engine/registry errors to status codes. |
 | **Voice manifest** | `src/syscon_tts/data/voices.json` | Declarative catalogue mapping stable voice ids to model filenames and download URLs. Ships inside the wheel. The extension point for new voices. |
@@ -123,8 +123,11 @@ Two structural properties matter:
 2. **Check the cache** — if `<alerts_dir>/<name>.wav` exists, return it
    immediately with `cached=True`. **Piper is never touched.** This is the
    whole cross-platform story: the branch works identically everywhere.
-3. **Resolve the voice** — on a miss, the requested voice (or the configured
-   default) is looked up in the registry. Unknown id → `UnknownVoiceError`.
+3. **Resolve the voice** — on a miss: an explicit `voice`, else the configured
+   default for `language`, else the catalogue's best match for that language
+   (exact locale before same-language, installed before not), else the default
+   voice. The result is looked up in the registry; an unknown id →
+   `UnknownVoiceError`.
 4. **Load the model (cached)** — `TTSEngine` checks its in-memory cache. On a
    miss it verifies files exist, imports Piper (→
    `SynthesisUnavailableError` on Windows/macOS), calls `PiperVoice.load(...)`,
@@ -132,9 +135,12 @@ Two structural properties matter:
 5. **Synthesize** — Piper runs CPU inference into an in-memory WAV container.
    `speed` maps to Piper's `length_scale` as `1.0 / speed`.
 6. **Write atomically** — the bytes go to a sibling temp file, are `fsync`'d,
-   then `os.replace`'d into position. The APU checks `path.exists()` before
-   pushing an audio URL to clients, so a partially written file would be served
-   as a truncated alert; a rename makes the file appear only when complete.
+   chmod'd to `file_mode`, then `os.replace`'d into position. The APU checks
+   `path.exists()` before pushing an audio URL to clients, so a partially
+   written file would be served as a truncated alert; a rename makes the file
+   appear only when complete. The chmod happens *before* the rename for the
+   same reason — `mkstemp` creates the file `0600`, and audio the web server
+   cannot read is as broken as audio that is half written.
 
 Error → status mapping (HTTP API): unknown voice → **404**, model not installed
 → **503**, host can never synthesize → **501**, empty/invalid text or synthesis
@@ -230,18 +236,26 @@ syscon_tts/
 
 ## 6. Configuration reference
 
-All configuration is environment variables; every one has a working default.
-Read into `Settings` (`config.py`) at load time.
+Every setting has a working default and can be supplied two ways: an
+environment variable, or a keyword to `load_settings()` /
+`AlertSynthesizer()`. Keywords win, and they are what an embedded caller
+should use — the APU would otherwise have to propagate environment variables
+through the Process Spawner to the Tornado socket managers.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `SYSCON_TTS_MANIFEST` | bundled `data/voices.json` | Voice manifest path |
+| `SYSCON_TTS_EXTRA_MANIFEST` | — | Overlay manifest merged over the bundled one |
 | `SYSCON_TTS_VOICES_DIR` | `<data dir>/voices` | Where `.onnx` models live |
 | `SYSCON_TTS_ALERTS_DIR` | `<data dir>/alerts` | Where alert WAVs are written |
 | `SYSCON_TTS_HOST` | `127.0.0.1` | API bind host |
 | `SYSCON_TTS_PORT` | `5002` | API bind port |
-| `SYSCON_TTS_DEFAULT_VOICE` | `en_us_amy` | Voice used when none is requested |
+| `SYSCON_TTS_DEFAULT_VOICE` | `en_us_kristin` | Voice used when none is requested |
+| `SYSCON_TTS_DEFAULT_VOICES` | — | Per-language defaults, `es-mx=es_mx_ald,...` |
 | `SYSCON_TTS_MAX_CHARS` | `20000` | Max text length accepted per request |
+| `SYSCON_TTS_MAX_LOADED_VOICES` | `3` | Models kept resident before LRU eviction |
+| `SYSCON_TTS_FILE_MODE` | `0644` | Mode applied to generated audio |
+| `SYSCON_TTS_DIR_MODE` | `0755` | Mode applied to directories this package creates |
 
 `<data dir>` is `/var/lib/syscon-tts` on Linux when writable, else
 `~/.local/share/syscon-tts`; `%LOCALAPPDATA%\syscon-tts` on Windows;
@@ -253,10 +267,12 @@ Read into `Settings` (`config.py`) at load time.
 
 Full recipes in [DEPLOY.md](../DEPLOY.md). In brief:
 
-- **APU / Linux:** `pip install syscon-tts` → `syscon-tts download-voices` →
-  `syscon-tts doctor`, with `SYSCON_TTS_VOICES_DIR` and `SYSCON_TTS_ALERTS_DIR`
-  pointed at the Django media tree. Rewrite `call_tts()` to call
-  `AlertSynthesizer.ensure()`.
+- **APU / Linux:** `pip install syscon-tts` →
+  `syscon-tts download-voices --language <site locale>` → `syscon-tts doctor`.
+  Voice models stay at the default `/var/lib/syscon-tts/voices`; only the
+  alerts directory points into the Django media tree, and it is passed as a
+  constructor keyword rather than an environment variable. Rewrite `call_tts()`
+  to call `AlertSynthesizer.ensure()` in a worker thread.
 - **Optional server:** `pip install 'syscon-tts[server]'` under the provided
   systemd unit.
 - **Offline/air-gapped:** `pip download` + `download-voices` on a networked
@@ -288,7 +304,7 @@ journalctl -u syscon-tts -f
 
 ```bash
 curl -s http://localhost:5002/health
-# {"status":"ok","can_synthesize":true,"voices_total":6,"voices_installed":N}
+# {"status":"ok","can_synthesize":true,"voices_total":8,"voices_installed":N}
 ```
 
 `voices_installed` < `voices_total` means some manifest voices have no model
@@ -317,7 +333,7 @@ Swap a voice's `medium` model for `low` (faster/smaller) or `high`
 |---|---|---|
 | `SynthesisUnavailableError` on Windows/macOS | Working as designed — no Piper | Generate audio on a Linux host; cached WAVs still replay |
 | `syscon-tts doctor` says Piper missing on Linux | Python 3.12+, or a partial install | Use Python 3.9–3.11, then `pip install 'syscon-tts[piper]'` |
-| `/synthesize` → 503, or `doctor` says `0/6` | Models not on disk | `syscon-tts download-voices`; check `SYSCON_TTS_VOICES_DIR` |
+| `/synthesize` → 503, or `doctor` says `0/N` | Models not on disk | `syscon-tts download-voices`; check `SYSCON_TTS_VOICES_DIR` |
 | `/synthesize` → 501 | Host can never synthesize | Expected off-Linux; not retryable |
 | `/synthesize` → 404 | Bad voice id | `GET /voices` for valid ids |
 | Alert audio never appears | `alerts_dir` mismatch | Confirm it equals `MEDIA_ROOT/public_alert_sounds` |
@@ -334,16 +350,25 @@ Swap a voice's `medium` model for `low` (faster/smaller) or `high`
 from syscon_tts import AlertSynthesizer, SynthesisUnavailableError
 ```
 
-### `AlertSynthesizer(settings=None, registry=None, engine=None)`
+### `AlertSynthesizer(settings=None, registry=None, engine=None, **setting_overrides)`
 
-Build once and keep it — the instance owns the model cache. All three arguments
-are injectable, which is how the test suite runs without Piper.
+Build once and keep it — the instance owns the model cache. The three
+collaborators are injectable, which is how the test suite runs without Piper;
+`**setting_overrides` (any `Settings` field, e.g. `alerts_dir=...`) is the
+embedded-caller path. Passing both a `settings` object and overrides is a
+`TypeError`.
 
 | Method | Description |
 |---|---|
-| `ensure(text, file_name=None, voice=None, alerts_dir=None, speed=1.0, sentence_silence=0.2, force=False)` | Return an `AlertAudio` for `text`, synthesizing only on a cache miss. |
+| `ensure(text, file_name=None, voice=None, alerts_dir=None, speed=1.0, sentence_silence=0.2, force=False, language=None)` | Return an `AlertAudio` for `text`, synthesizing only on a cache miss. |
+| `resolve_voice(voice=None, language=None)` | The voice id a request would use, without synthesizing. |
+| `preload(voice=None, language=None)` | Load a model now; returns the voice id. Call at startup. |
 | `exists(text, alerts_dir=None)` | Whether generated audio is already on disk. |
 | `path_for(file_name, alerts_dir=None)` | The path a given name would occupy. |
+
+Voice resolution order: explicit `voice` → `settings.default_voices[language]`
+→ the catalogue's best match for `language` (exact locale before same-language,
+installed before not) → `settings.default_voice`.
 
 ### `AlertAudio`
 
@@ -370,8 +395,14 @@ is accepted.
 ### Other helpers
 
 `sanitize_file_name(text, max_length=50)`, `piper_available()`,
-`load_settings()`, `ensure_alert_wav(text, **kwargs)` (one-shot; builds a
+`load_settings(**overrides)`, `normalize_language(code)` (locale → catalogue
+spelling: `"zh-hant"` → `"zh_CN"`), `resolve_voice_id(registry, settings,
+voice, language)`, `ensure_alert_wav(text, **kwargs)` (one-shot; builds a
 throwaway synthesizer, so avoid it in long-running processes).
+
+`VoiceProfile.requires_license_review` reports whether a voice's upstream
+license clears commercial use; `download_voices(..., accept_license=True)` is
+the acknowledgement.
 
 ---
 
@@ -405,7 +436,7 @@ syscon-tts [--version] <command> ...
 | `--sentence-silence` | Seconds of pause between sentences (default `0.2`) |
 
 Text resolution order: `--text-file` → positional → **stdin**, so
-`echo "hi" | syscon-tts speak -v en_us_amy -o hi.wav` works.
+`echo "hi" | syscon-tts speak -v en_us_kristin -o hi.wav` works.
 
 ### `alert`
 
@@ -437,22 +468,28 @@ authentication — intended for a trusted local segment. See [§12](#12-performa
 
 ### `GET /`
 ```json
-{"service":"Syscon TTS","version":"0.0.1","engine":"piper",
- "default_voice":"en_us_amy","endpoints":["/health","/voices","/synthesize"]}
+{"service":"Syscon TTS","version":"0.0.2","engine":"piper",
+ "default_voice":"en_us_kristin","endpoints":["/health","/voices","/synthesize"]}
 ```
 
 ### `GET /health`
 ```json
-{"status":"ok","can_synthesize":true,"voices_total":6,"voices_installed":6}
+{"status":"ok","can_synthesize":true,"voices_total":8,"voices_installed":2}
 ```
 
 ### `GET /voices`
+
+Optional `?language=es-mx` filters to the voices that serve a locale.
+
 ```json
 {
-  "default": "en_us_amy",
+  "default": "en_us_kristin",
+  "defaults_by_language": {"es_MX": "es_mx_ald"},
   "voices": [
-    {"id":"en_us_amy","name":"Amy — US English, female",
-     "language":"en_US","gender":"female","installed":true}
+    {"id":"en_us_kristin","name":"Kristin - US English, female",
+     "language":"en_US","gender":"female","quality":"medium",
+     "license":"public domain","requires_license_review":false,
+     "source":"manifest","installed":true}
   ]
 }
 ```

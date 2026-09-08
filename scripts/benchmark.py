@@ -19,7 +19,7 @@ By default it benchmarks every installed voice against three sample lengths.
 Restrict to specific voices by passing their ids, and use --json for machine
 -readable output (e.g. to archive results per deployment).
 
-    python scripts/benchmark.py en_us_amy en_us_ryan --runs 5
+    python scripts/benchmark.py en_us_kristin en_us_john --runs 5
     python scripts/benchmark.py --json > bench-$(hostname).json
 """
 
@@ -118,8 +118,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = load_settings()
-    registry = VoiceRegistry.from_manifest(settings.voices_manifest, settings.voices_dir)
-    engine = TTSEngine(registry)
+    registry = VoiceRegistry.from_settings(settings)
+    engine = TTSEngine(registry, settings.max_loaded_voices)
 
     if args.voices:
         requested = args.voices

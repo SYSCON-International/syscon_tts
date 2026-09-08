@@ -31,10 +31,12 @@ Paste the table from `scripts/benchmark.py`, or fill in per voice:
 
 | Voice | Cold load (s) | Mem (MB) | Short RTF | Med RTF | Long RTF | Long latency (s) |
 |-------|---------------|----------|-----------|---------|----------|------------------|
-| en_us_amy |  |  |  |  |  |  |
-| en_us_ryan |  |  |  |  |  |  |
-| en_gb_alan |  |  |  |  |  |  |
+| en_us_kristin |  |  |  |  |  |  |
+| en_us_john |  |  |  |  |  |  |
+| es_mx_ald |  |  |  |  |  |  |
+| es_mx_ald_x_low |  |  |  |  |  |  |
 | es_es_davefx |  |  |  |  |  |  |
+| zh_cn_huayan |  |  |  |  |  |  |
 | fr_fr_siwis |  |  |  |  |  |  |
 | de_de_thorsten |  |  |  |  |  |  |
 

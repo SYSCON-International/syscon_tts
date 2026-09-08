@@ -27,8 +27,8 @@ syscon-tts doctor
 To exercise real synthesis you need Linux with Python 3.9–3.11:
 
 ```bash
-syscon-tts download-voices en_us_amy   # one voice is enough for a smoke test
-syscon-tts speak -v en_us_amy -o /tmp/hi.wav "Hello"
+syscon-tts download-voices en_us_kristin   # one voice is enough for a smoke test
+syscon-tts speak -v en_us_kristin -o /tmp/hi.wav "Hello"
 ```
 
 On Windows or macOS, generate WAVs on a Linux host, drop them in your
@@ -82,12 +82,30 @@ function, re-verify against real Django rather than reasoning about the regex.
 
 Voices are **data, not code** — no source changes required:
 
-1. Add an entry to [`src/syscon_tts/data/voices.json`](src/syscon_tts/data/voices.json)
+1. **Read the voice's `MODEL_CARD` first** and record its `license` verbatim in
+   the entry. PlantStar is sold, so the bundled catalogue carries only voices
+   whose upstream license permits commercial use (public domain, CC0,
+   Unlicense, CC BY). Piper's catalogue contains plenty that do not —
+   `en_US-ryan` and the `hfc_*` voices are CC BY-NC-SA, and `zh_CN-chaowen` is
+   fine-tuned from a non-commercial voice, so its lineage is restricted too.
+   Anything else must set `notes` explaining what is unresolved; the tests
+   enforce that, and `doctor` surfaces it to operators.
+2. Add an entry to [`src/syscon_tts/data/voices.json`](src/syscon_tts/data/voices.json)
    with a unique `id` and the `model` / `config` filenames plus their
    `model_url` / `config_url` from
    [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices).
-2. `syscon-tts download-voices <new_id>`.
-3. Verify with `syscon-tts list-voices` (shows `installed: yes`).
+3. `syscon-tts download-voices <new_id>`.
+4. Verify with `syscon-tts list-voices` (shows `installed: yes`).
+
+**Never rename or remove a released id.** The APU stores the selected voice id
+in its settings table, so a rename silently breaks every site already using it;
+`test_bundled_manifest_ids_are_stable_and_well_formed` guards this. Add a new
+entry instead.
+
+A site that only wants a voice locally does not need a manifest change at all:
+dropping the `.onnx` + `.onnx.json` pair into the voices directory is enough
+(they are discovered), or it can layer its own file via
+`SYSCON_TTS_EXTRA_MANIFEST`.
 
 If you change the manifest schema itself, update `VoiceProfile` /
 `VoiceRegistry` in `voices.py` and the tests.

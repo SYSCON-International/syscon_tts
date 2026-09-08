@@ -1,8 +1,10 @@
 """Piper TTS engine wrapper.
 
-Loads Piper voice models lazily and keeps them cached in memory so the service
-does not pay model-load cost on every request. Synthesis produces WAV bytes;
-optional MP3 output is available when ``ffmpeg`` is present on the host.
+Loads Piper voice models lazily and keeps a bounded number of them cached in
+memory, so the service does not pay model-load cost on every request without
+letting a multilingual site grow unboundedly (each medium-quality model is
+roughly 60 MB resident). Synthesis produces WAV bytes; optional MP3 output is
+available when ``ffmpeg`` is present on the host.
 
 Piper only installs on Linux (see :func:`piper_available`). Importing this
 module is always safe -- the Piper import is deferred until synthesis is
@@ -10,6 +12,12 @@ actually attempted, and failure surfaces as
 :class:`SynthesisUnavailableError` rather than an ``ImportError``. That lets
 Windows and macOS machines import the package, list voices, and serve
 previously generated audio without Piper present.
+
+Thread safety: the APU calls this from a thread pool, because synthesis is a
+seconds-long CPU burn that must not block the Tornado IO loop. Loading is
+guarded per voice, and so is synthesis -- a single ``PiperVoice`` is not
+documented to be re-entrant, and serializing is what you want anyway on a CPU
+that has other jobs to do.
 """
 
 from __future__ import annotations
@@ -20,8 +28,10 @@ import shutil
 import subprocess
 import threading
 import wave
-from pathlib import Path
+from collections import OrderedDict
+from typing import Dict, List
 
+from .config import DEFAULT_MAX_LOADED_VOICES
 from .voices import VoiceNotInstalledError, VoiceProfile, VoiceRegistry
 
 
@@ -66,21 +76,55 @@ def _unavailable_reason() -> str:
 
 
 class TTSEngine:
-    def __init__(self, registry: VoiceRegistry):
+    def __init__(
+        self,
+        registry: VoiceRegistry,
+        max_loaded_voices: int = DEFAULT_MAX_LOADED_VOICES,
+    ):
         self._registry = registry
-        self._loaded: dict[str, object] = {}
+        self._max_loaded = max(1, int(max_loaded_voices))
+        # Least-recently-used first, so eviction pops from the front.
+        self._loaded: "OrderedDict[str, object]" = OrderedDict()
+        self._voice_locks: Dict[str, threading.Lock] = {}
+        # Guards the two maps above -- never held while loading or speaking.
         self._lock = threading.Lock()
 
     # -- model loading -----------------------------------------------------
 
+    def _voice_lock(self, voice_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._voice_locks.get(voice_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._voice_locks[voice_id] = lock
+            return lock
+
+    def _cached(self, voice_id: str):
+        with self._lock:
+            voice = self._loaded.get(voice_id)
+            if voice is not None:
+                self._loaded.move_to_end(voice_id)
+            return voice
+
+    def _remember(self, voice_id: str, voice) -> None:
+        with self._lock:
+            self._loaded[voice_id] = voice
+            self._loaded.move_to_end(voice_id)
+            while len(self._loaded) > self._max_loaded:
+                # Dropping a model another thread is mid-synthesis with is
+                # safe: that thread holds its own reference, and the memory is
+                # reclaimed once it finishes.
+                self._loaded.popitem(last=False)
+
     def _load_voice(self, profile: VoiceProfile):
-        cached = self._loaded.get(profile.id)
+        cached = self._cached(profile.id)
         if cached is not None:
             return cached
 
-        with self._lock:
-            # Re-check inside the lock in case another thread just loaded it.
-            cached = self._loaded.get(profile.id)
+        # One loader per voice; a second caller waits rather than loading a
+        # duplicate 60 MB model.
+        with self._voice_lock(profile.id):
+            cached = self._cached(profile.id)
             if cached is not None:
                 return cached
 
@@ -97,16 +141,23 @@ class TTSEngine:
             if not self._registry.is_installed(profile):
                 raise VoiceNotInstalledError(
                     f"Voice '{profile.id}' is not installed. Expected model at "
-                    f"{model_path}. Run 'syscon-tts download-voices' to fetch it."
+                    f"{model_path}. Run 'syscon-tts download-voices "
+                    f"{profile.id}' to fetch it."
                 )
 
             voice = PiperVoice.load(str(model_path), config_path=str(config_path))
-            self._loaded[profile.id] = voice
-            return voice
+
+        self._remember(profile.id, voice)
+        return voice
 
     def preload(self, voice_id: str) -> None:
         """Force a voice to load now (useful at startup)."""
         self._load_voice(self._registry.get(voice_id))
+
+    def loaded_voice_ids(self) -> List[str]:
+        """Currently resident voices, least recently used first."""
+        with self._lock:
+            return list(self._loaded)
 
     # -- synthesis ---------------------------------------------------------
 
@@ -133,13 +184,16 @@ class TTSEngine:
 
         buffer = io.BytesIO()
         try:
-            with wave.open(buffer, "wb") as wav_file:
-                voice.synthesize(
-                    text,
-                    wav_file,
-                    length_scale=length_scale,
-                    sentence_silence=sentence_silence,
-                )
+            # Serialize per voice: concurrent synthesis on one model has no
+            # documented guarantee, and parallel CPU burn is not a win here.
+            with self._voice_lock(profile.id):
+                with wave.open(buffer, "wb") as wav_file:
+                    voice.synthesize(
+                        text,
+                        wav_file,
+                        length_scale=length_scale,
+                        sentence_silence=sentence_silence,
+                    )
         except VoiceNotInstalledError:
             raise
         except Exception as exc:  # pragma: no cover - piper runtime failure
@@ -153,7 +207,7 @@ class TTSEngine:
         fmt: str = "wav",
         speed: float = 1.0,
         sentence_silence: float = 0.2,
-    ) -> tuple[bytes, str]:
+    ) -> "tuple[bytes, str]":
         """Render ``text`` and return ``(audio_bytes, media_type)``.
 
         Supported ``fmt`` values: ``wav`` (always) and ``mp3`` (requires

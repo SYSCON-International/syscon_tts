@@ -3,11 +3,12 @@
 Usage examples::
 
     syscon-tts doctor
-    syscon-tts download-voices                    # fetch every voice
-    syscon-tts download-voices en_us_amy          # or just one
+    syscon-tts download-voices                     # fetch the whole catalogue
+    syscon-tts download-voices --language es-mx    # or just one site's language
+    syscon-tts download-voices en_us_kristin       # or one named voice
     syscon-tts list-voices
-    syscon-tts speak --voice en_us_amy --output hello.wav "Hello from PlantStar"
-    syscon-tts alert "Press 4 cavity pressure exceeded."
+    syscon-tts speak --voice en_us_kristin --output hello.wav "Hello from PlantStar"
+    syscon-tts alert --language es-mx "Presion de cavidad excedida en prensa 4."
     syscon-tts serve --host 127.0.0.1 --port 5002
 
 Every command except ``download-voices`` runs fully offline. ``doctor``,
@@ -24,7 +25,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .alerts import AlertSynthesizer, InvalidAlertNameError
+from .alerts import AlertSynthesizer, InvalidAlertNameError, resolve_voice_id
 from .config import load_settings
 from .download import DownloadError, download_voices
 from .engine import SynthesisError, SynthesisUnavailableError, TTSEngine, piper_available
@@ -33,20 +34,41 @@ from .voices import VoiceError, VoiceRegistry
 
 def _build_registry_and_engine():
     settings = load_settings()
-    registry = VoiceRegistry.from_manifest(settings.voices_manifest, settings.voices_dir)
-    return settings, registry, TTSEngine(registry)
+    registry = VoiceRegistry.from_settings(settings)
+    return settings, registry, TTSEngine(registry, settings.max_loaded_voices)
 
 
 def _cmd_list_voices(args: argparse.Namespace) -> int:
     settings, registry, _ = _build_registry_and_engine()
+    profiles = registry.all()
+    if args.language:
+        profiles = registry.for_language(args.language)
+        if not profiles:
+            print(
+                f"No voice for language '{args.language}'. "
+                f"Known languages: {', '.join(registry.languages())}.",
+                file=sys.stderr,
+            )
+            return 1
+
     print(f"Default voice: {settings.default_voice}")
+    for language, voice_id in sorted(settings.default_voices.items()):
+        print(f"  {language:<8} {voice_id}")
     print(f"Voices dir:    {settings.voices_dir}\n")
-    header = f"{'ID':<22} {'LANGUAGE':<8} {'GENDER':<10} {'INSTALLED':<9} NAME"
+
+    header = (
+        f"{'ID':<22} {'LANGUAGE':<8} {'QUALITY':<8} {'GENDER':<12} "
+        f"{'INSTALLED':<10} {'LICENSE':<16} NAME"
+    )
     print(header)
     print("-" * len(header))
-    for p in registry.all():
+    for p in profiles:
         installed = "yes" if registry.is_installed(p) else "no"
-        print(f"{p.id:<22} {p.language:<8} {p.gender:<10} {installed:<9} {p.name}")
+        license_note = p.license + (" (review)" if p.requires_license_review else "")
+        print(
+            f"{p.id:<22} {p.language:<8} {p.quality:<8} {p.gender:<12} "
+            f"{installed:<10} {license_note:<16} {p.name}"
+        )
     return 0
 
 
@@ -57,25 +79,56 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  platform          {platform.system()} {platform.machine()}")
     print(f"  python            {platform.python_version()}")
     print(f"  manifest          {settings.voices_manifest}")
+    if settings.extra_manifest:
+        print(f"  extra manifest    {settings.extra_manifest}")
     print(f"  voices dir        {settings.voices_dir}")
     print(f"  alerts dir        {settings.alerts_dir}")
+    print(f"  audio file mode   {settings.file_mode:04o}")
+    print(f"  models in memory  up to {settings.max_loaded_voices}")
     print(f"  ffmpeg (mp3)      {'yes' if shutil.which('ffmpeg') else 'no'}")
 
     has_piper = piper_available()
     print(f"  piper (synthesis) {'yes' if has_piper else 'no'}")
 
     try:
-        registry = VoiceRegistry.from_manifest(
-            settings.voices_manifest, settings.voices_dir
-        )
+        registry = VoiceRegistry.from_settings(settings)
     except VoiceError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 1
 
-    installed = [p for p in registry.all() if registry.is_installed(p)]
+    installed = registry.installed()
     print(f"  voices installed  {len(installed)}/{len(registry.all())}")
+    discovered = [p for p in installed if p.source == "disk"]
+    if discovered:
+        print(
+            f"  found on disk     {len(discovered)} "
+            f"({', '.join(p.id for p in discovered)})"
+        )
+    print(f"  default voice     {settings.default_voice}")
+    for language, voice_id in sorted(settings.default_voices.items()):
+        print(f"    {language:<8} {voice_id}")
 
     problems = []
+
+    unreviewed = [p for p in installed if p.requires_license_review]
+    if unreviewed:
+        # Not a "problem" in the exit-code sense -- the models work fine. It is
+        # a shipping question, and the operator is the one who can answer it.
+        print(
+            "\nLicense review needed before these go to a customer:\n"
+            + "\n".join(
+                f"  - {p.id}: {p.license}"
+                + (f" ({p.license_url})" if p.license_url else "")
+                for p in unreviewed
+            )
+        )
+
+    for voice_id in [settings.default_voice, *settings.default_voices.values()]:
+        if not registry.has(voice_id):
+            problems.append(
+                f"Configured voice '{voice_id}' is not in the catalogue. "
+                "Check SYSCON_TTS_DEFAULT_VOICE / SYSCON_TTS_DEFAULT_VOICES."
+            )
     if not has_piper:
         if platform.system() == "Linux":
             problems.append(
@@ -116,6 +169,8 @@ def _cmd_download_voices(args: argparse.Namespace) -> int:
             voice_ids=args.voice_ids,
             force=args.force,
             on_progress=print,
+            language=args.language,
+            accept_license=args.accept_license,
         )
     except (DownloadError, VoiceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -138,9 +193,9 @@ def _read_text(args: argparse.Namespace) -> str:
 
 
 def _cmd_speak(args: argparse.Namespace) -> int:
-    settings, _, engine = _build_registry_and_engine()
+    settings, registry, engine = _build_registry_and_engine()
     text = _read_text(args)
-    voice_id = args.voice or settings.default_voice
+    voice_id = resolve_voice_id(registry, settings, args.voice, args.language)
     fmt = args.format or ("mp3" if args.output.lower().endswith(".mp3") else "wav")
     try:
         audio, _ = engine.synthesize(
@@ -166,6 +221,7 @@ def _cmd_alert(args: argparse.Namespace) -> int:
             args.text,
             file_name=args.file_name,
             voice=args.voice,
+            language=args.language,
             alerts_dir=Path(args.alerts_dir) if args.alerts_dir else None,
             force=args.force,
         )
@@ -216,6 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.set_defaults(func=_cmd_doctor)
 
     p_list = sub.add_parser("list-voices", help="List available voice profiles.")
+    p_list.add_argument("-l", "--language",
+                        help="Only voices for this locale, e.g. es-mx, zh-hans.")
     p_list.set_defaults(func=_cmd_list_voices)
 
     p_dl = sub.add_parser(
@@ -223,13 +281,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_dl.add_argument("voice_ids", nargs="*",
                       help="Voice ids to fetch (default: all in the manifest).")
+    p_dl.add_argument("-l", "--language",
+                      help="Fetch only this locale's voices, e.g. es-mx.")
     p_dl.add_argument("--force", action="store_true",
                       help="Re-download even if the file is already present.")
+    p_dl.add_argument("--accept-license", action="store_true",
+                      help="Also fetch voices whose license needs review "
+                           "(see 'doctor'); confirms someone has cleared it.")
     p_dl.set_defaults(func=_cmd_download_voices)
 
     p_speak = sub.add_parser("speak", help="Synthesize text to an audio file.")
     p_speak.add_argument("text", nargs="?", help="Text to speak.")
     p_speak.add_argument("-v", "--voice", help="Voice id (see list-voices).")
+    p_speak.add_argument("-l", "--language",
+                         help="Pick a voice by locale instead, e.g. zh-hans.")
     p_speak.add_argument("-o", "--output", required=True, help="Output file path.")
     p_speak.add_argument("-f", "--format", choices=["wav", "mp3"],
                          help="Output format (default: inferred from --output).")
@@ -246,6 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_alert.add_argument("text", help="Alert message text.")
     p_alert.add_argument("-v", "--voice", help="Voice id (see list-voices).")
+    p_alert.add_argument("-l", "--language",
+                         help="Pick a voice by locale instead, e.g. es-mx.")
     p_alert.add_argument("--file-name",
                          help="Override the derived file name (no extension).")
     p_alert.add_argument("--alerts-dir",

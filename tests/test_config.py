@@ -24,12 +24,17 @@ from syscon_tts.engine import (
 
 ENV_VARS = [
     "SYSCON_TTS_MANIFEST",
+    "SYSCON_TTS_EXTRA_MANIFEST",
     "SYSCON_TTS_VOICES_DIR",
     "SYSCON_TTS_ALERTS_DIR",
     "SYSCON_TTS_HOST",
     "SYSCON_TTS_PORT",
     "SYSCON_TTS_DEFAULT_VOICE",
+    "SYSCON_TTS_DEFAULT_VOICES",
     "SYSCON_TTS_MAX_CHARS",
+    "SYSCON_TTS_MAX_LOADED_VOICES",
+    "SYSCON_TTS_FILE_MODE",
+    "SYSCON_TTS_DIR_MODE",
 ]
 
 
@@ -81,10 +86,65 @@ def test_describe_is_json_safe(monkeypatch):
     _clear_env(monkeypatch)
     described = load_settings().describe()
     assert set(described) == {
-        "voices_manifest", "voices_dir", "alerts_dir",
-        "host", "port", "default_voice", "max_text_chars",
+        "voices_manifest", "extra_manifest", "voices_dir", "alerts_dir",
+        "host", "port", "default_voice", "default_voices", "max_text_chars",
+        "max_loaded_voices", "file_mode", "dir_mode",
     }
-    assert all(isinstance(v, (str, int)) for v in described.values())
+    assert all(
+        v is None or isinstance(v, (str, int, dict)) for v in described.values()
+    )
+
+
+def test_settings_can_be_built_without_the_environment(monkeypatch, tmp_path):
+    # The embedded caller (the APU) knows its own paths and must not have to
+    # set process-wide environment variables to pass them in.
+    _clear_env(monkeypatch)
+    settings = load_settings(alerts_dir=tmp_path / "alerts")
+    assert settings.alerts_dir == tmp_path / "alerts"
+    assert settings.voices_manifest == default_manifest_path()  # untouched
+    assert settings.host == "127.0.0.1"
+
+
+def test_overrides_accept_strings_and_ignore_none(monkeypatch, tmp_path):
+    _clear_env(monkeypatch)
+    baseline = load_settings()
+    settings = load_settings(voices_dir=str(tmp_path), alerts_dir=None)
+    assert settings.voices_dir == tmp_path
+    assert settings.alerts_dir == baseline.alerts_dir
+
+
+def test_unknown_override_is_rejected(monkeypatch):
+    # A typo'd keyword silently doing nothing would be discovered in
+    # production, as audio in the wrong place.
+    _clear_env(monkeypatch)
+    with pytest.raises(TypeError):
+        load_settings(alert_dir="/tmp/typo")
+
+
+def test_per_language_defaults_from_env(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv(
+        "SYSCON_TTS_DEFAULT_VOICES", "zh-hans=zh_cn_huayan, es-mx=es_mx_ald"
+    )
+    settings = load_settings()
+    # Keys are normalized, so the APU's locale spelling matches at lookup time.
+    assert settings.default_voices == {
+        "zh_CN": "zh_cn_huayan",
+        "es_MX": "es_mx_ald",
+    }
+
+
+def test_malformed_per_language_defaults_raise(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SYSCON_TTS_DEFAULT_VOICES", "zh_cn_huayan")
+    with pytest.raises(ValueError):
+        load_settings()
+
+
+def test_file_mode_is_read_as_octal(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SYSCON_TTS_FILE_MODE", "640")
+    assert load_settings().file_mode == 0o640
 
 
 def test_default_data_dir_is_absolute():
@@ -166,7 +226,7 @@ def test_missing_piper_is_reported_before_missing_models(tmp_path, monkeypatch):
         alerts_dir=tmp_path / "alerts",
         host="127.0.0.1",
         port=5002,
-        default_voice="en_us_amy",
+        default_voice="en_us_kristin",
         max_text_chars=20000,
     )
     registry = VoiceRegistry.from_manifest(
@@ -175,7 +235,7 @@ def test_missing_piper_is_reported_before_missing_models(tmp_path, monkeypatch):
     engine = TTSEngine(registry)
 
     try:
-        engine.synthesize_wav("hello", "en_us_amy")
+        engine.synthesize_wav("hello", "en_us_kristin")
     except SynthesisUnavailableError as exc:
         assert "not available" in str(exc) or "could not be imported" in str(exc)
     except VoiceNotInstalledError:

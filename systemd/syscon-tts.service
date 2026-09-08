@@ -8,13 +8,15 @@ Type=simple
 User=plantstar
 WorkingDirectory=/opt/syscon-tts
 
-# Point the service at the APU's media tree so generated alert audio lands
-# where the websocket handler and /media/ serving already look for it.
-Environment=SYSCON_TTS_VOICES_DIR=/opt/plantstar_apu/website/media/tts_voices
+# Voice models live outside the APU tree: they are large, immutable, and
+# re-downloadable, and anything under MEDIA_ROOT is copied into every backup.
+# Generated alert audio does go to the media tree, where the websocket handler
+# and /media/ serving already look for it.
+Environment=SYSCON_TTS_VOICES_DIR=/var/lib/syscon-tts/voices
 Environment=SYSCON_TTS_ALERTS_DIR=/opt/plantstar_apu/website/media/public_alert_sounds
 Environment=SYSCON_TTS_HOST=127.0.0.1
 Environment=SYSCON_TTS_PORT=5002
-Environment=SYSCON_TTS_DEFAULT_VOICE=en_us_amy
+Environment=SYSCON_TTS_DEFAULT_VOICE=en_us_kristin
 
 ExecStart=/opt/syscon-tts/.venv/bin/syscon-tts serve
 Restart=on-failure
