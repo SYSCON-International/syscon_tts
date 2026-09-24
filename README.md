@@ -104,7 +104,6 @@ threading requirement: [DEPLOY.md](DEPLOY.md).
 | `en_us_kristin` | en_US | Kristin — female (**default**) | public domain |
 | `en_us_john` | en_US | John — male | public domain |
 | `es_mx_ald` | es_MX | Ald — Mexican Spanish | Unlicense |
-| `es_mx_ald_x_low` | es_MX | Ald — smallest model | Unlicense |
 | `es_es_davefx` | es_ES | DaveFX — male (Castilian) | CC0 |
 | `zh_cn_huayan` | zh_CN | Huayan — Mandarin | **unknown — needs review** |
 | `fr_fr_siwis` | fr_FR | Siwis — female | CC BY 4.0 (attribution) |

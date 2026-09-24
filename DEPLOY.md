@@ -350,10 +350,9 @@ es_MX-ald-medium.onnx   ->  es_MX-ald-x_low.onnx
 .../ald/medium/...      ->  .../ald/x_low/...
 ```
 
-(`es_mx_ald_x_low` is already catalogued as a worked example, and doubles as
-the smallest download for a smoke test.) Not every voice publishes a lower
-tier — check the voice's folder at
-<https://huggingface.co/rhasspy/piper-voices>.
+The shipped catalogue carries only `medium` models, so a site that wants a
+lower tier adds it this way. Not every voice publishes a lower tier — check
+the voice's folder at <https://huggingface.co/rhasspy/piper-voices>.
 
 Rule of thumb on APU-class CPUs: `medium` runs a few times faster than
 real-time; `low` is faster still with a modest quality drop. Measure on the

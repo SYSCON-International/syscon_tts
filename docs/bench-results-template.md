@@ -34,7 +34,6 @@ Paste the table from `scripts/benchmark.py`, or fill in per voice:
 | en_us_kristin |  |  |  |  |  |  |
 | en_us_john |  |  |  |  |  |  |
 | es_mx_ald |  |  |  |  |  |  |
-| es_mx_ald_x_low |  |  |  |  |  |  |
 | es_es_davefx |  |  |  |  |  |  |
 | zh_cn_huayan |  |  |  |  |  |  |
 | fr_fr_siwis |  |  |  |  |  |  |

@@ -43,19 +43,6 @@
       "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json"
     },
     {
-      "id": "es_mx_ald_x_low",
-      "name": "Ald - Mexican Spanish, smallest",
-      "language": "es_MX",
-      "gender": "unspecified",
-      "quality": "x_low",
-      "license": "Unlicense",
-      "license_url": "https://huggingface.co/datasets/rmcpantoja/Ald_Mexican_Spanish_speech_dataset",
-      "model": "es_MX-ald-x_low.onnx",
-      "config": "es_MX-ald-x_low.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/ald/x_low/es_MX-ald-x_low.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/ald/x_low/es_MX-ald-x_low.onnx.json"
-    },
-    {
       "id": "es_es_davefx",
       "name": "DaveFX - Spanish (Spain), male",
       "language": "es_ES",

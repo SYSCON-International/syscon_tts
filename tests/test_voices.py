@@ -87,12 +87,12 @@ def test_bundled_manifest_names_are_ascii():
 
 def test_bundled_manifest_ids_are_stable_and_well_formed():
     # Ids are stored in the APU's settings table. Renaming one silently breaks
-    # every site already using it, so released ids may only be added to.
+    # every site already using it, so once the APU ships, ids may only be added
+    # to. (es_mx_ald_x_low was withdrawn in 0.0.3, before any APU stored it.)
     released = {
         "en_us_kristin",
         "en_us_john",
         "es_mx_ald",
-        "es_mx_ald_x_low",
         "es_es_davefx",
         "zh_cn_huayan",
         "fr_fr_siwis",

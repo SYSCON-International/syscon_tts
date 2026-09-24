@@ -147,9 +147,12 @@ can't touch other packages.
 twine upload --repository syscon_tts dist/*
 ```
 
-Use the explicit `--repository` for this one so the right token is selected.
 `--repository` names the `~/.pypirc` section, not the package — the two just
-happen to match here by convention.
+happen to match here by convention. `upload_dist.sh` selects the same section
+by default (it exports `TWINE_REPOSITORY=syscon_tts`), so the explicit flag is
+only needed when twine is invoked by hand. Either way the section has to be
+named: with no repository selected twine falls through to `[pypi]`, and a
+project-scoped token sitting in `[syscon_tts]` would never be read.
 
 ### Every release after that
 
