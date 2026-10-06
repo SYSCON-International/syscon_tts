@@ -6,7 +6,7 @@ Architecture, components, deployment, operations, and interface reference.
 - **Scope:** how it is built and how it runs. For a quick start see
   [README.md](../README.md); for step-by-step deployment recipes see
   [DEPLOY.md](../DEPLOY.md).
-- **Version:** 0.1.0
+- **Version:** 0.0.4
 
 ---
 
@@ -481,7 +481,7 @@ restart. Or cap synthesis threads with `SYSCON_TTS_THREADS`. See
 | `/synthesize` → 404 | Bad voice id | `GET /voices` for valid ids |
 | Alert audio never appears | `alerts_dir` mismatch | Confirm it equals `MEDIA_ROOT/public_alert_sounds` |
 | Client URL 404s but `ensure()` succeeded | APU built the URL from its own `get_valid_filename(...)[:50]` | Use `file_name_for(text, language=...)` for the URL, `open_files` and `ensure()` |
-| `syscon-tts alert` exits `69` | Audio must be rendered and this host has no Piper (a fingerprint-less or mismatched file is a miss) | Generate the WAV on a Linux host running 0.1.0+ (so it carries a fingerprint) with the same text and voice, and copy it across |
+| `syscon-tts alert` exits `69` | Audio must be rendered and this host has no Piper (a fingerprint-less or mismatched file is a miss) | Generate the WAV on a Linux host running 0.0.4 or later (so it carries a fingerprint) with the same text and voice, and copy it across |
 | `AlertTextTooLongError` | Text over `max_alert_chars` (1000) | Shorten or split the message; raise `SYSCON_TTS_MAX_ALERT_CHARS` only deliberately |
 | `IntegrityError` on download, or `doctor` reports a SHA-256 mismatch | Upstream file changed, or a corrupt/partial copy | `syscon-tts download-voices --force <id>`; for an overlay voice, check its hashes |
 | `download-voices`: permission denied | `/var/lib/syscon-tts` exists but is not writable by this user | Re-run with `sudo`, or set `SYSCON_TTS_VOICES_DIR` |
@@ -647,7 +647,7 @@ still works, because `app` is built lazily on first access.
 
 ### `GET /`
 ```json
-{"service":"Syscon TTS","version":"0.1.0","engine":"piper",
+{"service":"Syscon TTS","version":"0.0.4","engine":"piper",
  "default_voice":"en_us_kristin","endpoints":["/health","/voices","/synthesize"]}
 ```
 

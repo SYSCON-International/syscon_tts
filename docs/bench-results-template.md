@@ -22,7 +22,7 @@ syscon-tts benchmark --threads 2                       # compare against a threa
 | CPU (model, cores) | <e.g. Intel Atom x6425E, 4 cores> |
 | RAM | <e.g. 8 GB> |
 | OS / Python | <e.g. Debian 12 / Python 3.11> |
-| Service version | <e.g. 0.1.0> |
+| Service version | <e.g. 0.0.4> |
 | Voice quality tier | <medium / low / mixed> |
 | threads | <default (one per physical core) / e.g. 2> |
 | benchmark --runs | <e.g. 5> |
