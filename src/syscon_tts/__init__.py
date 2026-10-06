@@ -23,6 +23,10 @@ miss::
     result = synth.ensure("Press 4 cavity pressure exceeded.")
     print(result.path, result.cached)
 
+The file name is derived from the text and voice (``synth.file_name_for``),
+unique per message, so a caller that needs the name up front -- to build a
+URL -- asks for it rather than computing its own.
+
 Multilingual sites select a voice by locale rather than by id::
 
     synth.ensure(message, language="es-mx")
@@ -31,13 +35,20 @@ Multilingual sites select a voice by locale rather than by id::
 from .alerts import (
     AlertAudio,
     AlertSynthesizer,
+    AlertTextTooLongError,
     InvalidAlertNameError,
+    alert_file_name,
     ensure_alert_wav,
     resolve_voice_id,
     sanitize_file_name,
 )
 from .config import Settings, load_settings
-from .download import DownloadError, LicenseReviewRequired, download_voices
+from .download import (
+    DownloadError,
+    IntegrityError,
+    LicenseReviewRequired,
+    download_voices,
+)
 from .engine import (
     SynthesisError,
     SynthesisUnavailableError,
@@ -53,12 +64,14 @@ from .voices import (
     normalize_language,
 )
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     "AlertAudio",
     "AlertSynthesizer",
+    "AlertTextTooLongError",
     "DownloadError",
+    "IntegrityError",
     "InvalidAlertNameError",
     "LicenseReviewRequired",
     "Settings",
@@ -71,6 +84,7 @@ __all__ = [
     "VoiceProfile",
     "VoiceRegistry",
     "__version__",
+    "alert_file_name",
     "download_voices",
     "ensure_alert_wav",
     "load_settings",

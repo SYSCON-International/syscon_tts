@@ -4,17 +4,22 @@ The packaging bug these guard against: paths used to be derived from the source
 tree, which silently breaks once the package is installed into site-packages.
 """
 
+import os
 import re
 from pathlib import Path
 
 import pytest
 
 import syscon_tts
+from syscon_tts import config as config_mod
 from syscon_tts.config import (
+    ENV_NAMES,
     PACKAGE_DIR,
+    Settings,
     default_data_dir,
     default_manifest_path,
     load_settings,
+    resolve_data_dir,
 )
 from syscon_tts.engine import (
     SynthesisError,
@@ -22,20 +27,7 @@ from syscon_tts.engine import (
     piper_available,
 )
 
-ENV_VARS = [
-    "SYSCON_TTS_MANIFEST",
-    "SYSCON_TTS_EXTRA_MANIFEST",
-    "SYSCON_TTS_VOICES_DIR",
-    "SYSCON_TTS_ALERTS_DIR",
-    "SYSCON_TTS_HOST",
-    "SYSCON_TTS_PORT",
-    "SYSCON_TTS_DEFAULT_VOICE",
-    "SYSCON_TTS_DEFAULT_VOICES",
-    "SYSCON_TTS_MAX_CHARS",
-    "SYSCON_TTS_MAX_LOADED_VOICES",
-    "SYSCON_TTS_FILE_MODE",
-    "SYSCON_TTS_DIR_MODE",
-]
+ENV_VARS = list(ENV_NAMES.values())
 
 
 def _clear_env(monkeypatch):
@@ -88,7 +80,7 @@ def test_describe_is_json_safe(monkeypatch):
     assert set(described) == {
         "voices_manifest", "extra_manifest", "voices_dir", "alerts_dir",
         "host", "port", "default_voice", "default_voices", "max_text_chars",
-        "max_loaded_voices", "file_mode", "dir_mode",
+        "max_alert_chars", "max_loaded_voices", "threads", "file_mode", "dir_mode",
     }
     assert all(
         v is None or isinstance(v, (str, int, dict)) for v in described.values()
@@ -151,6 +143,112 @@ def test_default_data_dir_is_absolute():
     assert default_data_dir().is_absolute()
 
 
+# -- keyword overrides are normalized like the environment -------------------
+
+
+def test_override_language_keys_are_normalized(monkeypatch):
+    # {"es-mx": ...} used to be stored as-is and then never matched at lookup.
+    _clear_env(monkeypatch)
+    settings = load_settings(default_voices={"es-mx": "es_es_davefx", "zh-hans": "x"})
+    assert settings.default_voices == {"es_MX": "es_es_davefx", "zh_CN": "x"}
+
+
+@pytest.mark.parametrize("value", ["0644", "644", 0o644])
+def test_override_file_mode_accepts_octal_strings(monkeypatch, value):
+    _clear_env(monkeypatch)
+    assert load_settings(file_mode=value).file_mode == 0o644
+
+
+def test_override_ints_are_coerced(monkeypatch):
+    _clear_env(monkeypatch)
+    settings = load_settings(port="5003", max_loaded_voices="2", threads="1")
+    assert (settings.port, settings.max_loaded_voices, settings.threads) == (5003, 2, 1)
+
+
+def test_direct_construction_is_normalized_too():
+    settings = Settings(
+        default_voices={"es-mx": "es_mx_ald"}, file_mode="0640", port="9000",
+        voices_dir="relative/voices",
+    )
+    assert settings.default_voices == {"es_MX": "es_mx_ald"}
+    assert settings.file_mode == 0o640
+    assert settings.port == 9000
+    assert isinstance(settings.voices_dir, Path)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("port", "not-a-port"), ("file_mode", "rw-r--r--"), ("threads", 0),
+     ("max_alert_chars", -1), ("port", True)],
+)
+def test_bad_values_are_rejected(field, value):
+    with pytest.raises(ValueError):
+        Settings(**{field: value})
+
+
+def test_bad_env_value_names_the_variable(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SYSCON_TTS_THREADS", "lots")
+    with pytest.raises(ValueError, match="SYSCON_TTS_THREADS"):
+        load_settings()
+
+
+def test_threads_default_to_onnxruntime(monkeypatch):
+    _clear_env(monkeypatch)
+    assert load_settings().threads is None
+
+
+# -- data directory choice on Linux ---------------------------------------------
+
+
+@pytest.fixture
+def linux(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_mod.sys, "platform", "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    return tmp_path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX permissions")
+def test_existing_system_dir_wins_even_when_read_only(linux, monkeypatch):
+    # Provisioned with sudo, then inspected by an ordinary user: models only
+    # need to be readable, so this must not fall back to ~/.local/share.
+    system = linux / "var-lib" / "syscon-tts"
+    system.mkdir(parents=True)
+    os.chmod(system, 0o555)
+    monkeypatch.setattr(config_mod, "SYSTEM_DATA_DIR", system)
+    try:
+        path, reason = resolve_data_dir()
+    finally:
+        os.chmod(system, 0o755)
+    assert path == system
+    assert "exists" in reason
+
+
+def test_existing_system_dir_is_chosen(linux, monkeypatch):
+    system = linux / "var-lib" / "syscon-tts"
+    system.mkdir(parents=True)
+    monkeypatch.setattr(config_mod, "SYSTEM_DATA_DIR", system)
+    assert resolve_data_dir()[0] == system
+
+
+def test_creatable_system_dir_is_chosen(linux, monkeypatch):
+    (linux / "var-lib").mkdir()
+    system = linux / "var-lib" / "syscon-tts"
+    monkeypatch.setattr(config_mod, "SYSTEM_DATA_DIR", system)
+    path, reason = resolve_data_dir()
+    assert path == system
+    assert "created" in reason
+
+
+def test_falls_back_to_xdg_when_system_dir_is_unavailable(linux, monkeypatch):
+    monkeypatch.setattr(
+        config_mod, "SYSTEM_DATA_DIR", linux / "missing-parent" / "syscon-tts"
+    )
+    path, reason = resolve_data_dir()
+    assert path == linux / "xdg" / "syscon-tts"
+    assert "fallback" in reason
+
+
 # -- platform gating -------------------------------------------------------
 
 
@@ -184,6 +282,25 @@ def test_declared_version_matches_pyproject():
     assert syscon_tts.__version__ == declared, (
         f"__init__.py says {syscon_tts.__version__} but pyproject.toml says "
         f"{declared}; bump both together"
+    )
+
+
+def test_piper_engine_stays_pinned_to_1_2_0():
+    """piper-tts must not move past 1.2.x without a legal review.
+
+    1.2.0 is MIT, but piper-tts >= 1.3 moved to OHF-voice/piper1-gpl and is
+    GPL-3.0-or-later. A routine dependency bump would silently relicense what
+    ships on customer hardware. See README, "Engine licensing".
+    """
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if not pyproject.is_file():
+        pytest.skip("pyproject.toml not available")
+    text = pyproject.read_text(encoding="utf-8")
+    pins = re.findall(r'"piper-tts([^";]*)', text)
+    assert pins, "piper-tts dependency not found"
+    assert set(pins) == {"==1.2.0"}, (
+        f"piper-tts pin changed to {pins}; engine licence needs legal review "
+        "before this can move (see README, Engine licensing)"
     )
 
 
@@ -241,7 +358,7 @@ def test_missing_piper_is_reported_before_missing_models(tmp_path, monkeypatch):
     except VoiceNotInstalledError:
         raise AssertionError(
             "reported missing models when the real problem is a missing engine"
-        )
+        ) from None
     else:
         raise AssertionError("expected SynthesisUnavailableError")
 

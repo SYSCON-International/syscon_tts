@@ -1,6 +1,9 @@
-"""Downloader selection rules. Nothing here touches the network."""
+"""Downloader tests. Nothing here touches the network."""
 
+import hashlib
+import io
 import json
+import urllib.error
 
 import pytest
 
@@ -8,10 +11,14 @@ from syscon_tts import download as download_mod
 from syscon_tts.config import default_manifest_path
 from syscon_tts.download import (
     DownloadError,
+    IntegrityError,
     LicenseReviewRequired,
+    _fetch,
+    download_voice,
     download_voices,
+    verify_voice,
 )
-from syscon_tts.voices import VoiceRegistry
+from syscon_tts.voices import UnknownVoiceError, VoiceProfile, VoiceRegistry
 
 
 @pytest.fixture
@@ -76,7 +83,7 @@ def test_unknown_language_is_an_error(registry, fetched, tmp_path):
 
 
 def test_unknown_voice_id_raises_before_any_download(registry, fetched, tmp_path):
-    with pytest.raises(Exception):
+    with pytest.raises(UnknownVoiceError):
         download_voices(registry, tmp_path, voice_ids=["es_mx_ald", "nope"])
     assert fetched == []
 
@@ -98,3 +105,139 @@ def test_discovered_voices_do_not_break_a_bulk_download(tmp_path, fetched):
     assert "en_us_site_medium" not in fetched
     assert any("en_us_site_medium" in note for note in notes)
     assert "en_us_kristin" in fetched
+
+
+# -- integrity pins --------------------------------------------------------
+
+
+def test_every_catalogued_asset_is_pinned(registry):
+    # A URL on 'main' is a moving target: an upstream re-upload would change
+    # how a voice id sounds on every newly provisioned site.
+    for profile in registry.all():
+        for url in (profile.model_url, profile.config_url):
+            assert "/resolve/main/" not in url, url
+            assert "/resolve/" in url, url
+        for digest in (profile.model_sha256, profile.config_sha256):
+            assert len(digest) == 64 and int(digest, 16) >= 0, profile.id
+
+
+# -- fetching (urlopen replaced) -------------------------------------------
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@pytest.fixture
+def serve(monkeypatch):
+    """Make urlopen return ``payload``, or raise ``error``."""
+    state = {"payload": b"", "error": None, "urls": []}
+
+    def fake_urlopen(url, timeout=None):
+        state["urls"].append(url)
+        if state["error"]:
+            raise state["error"]
+        return FakeResponse(state["payload"])
+
+    monkeypatch.setattr(download_mod.urllib.request, "urlopen", fake_urlopen)
+    return state
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_fetch_writes_the_file_atomically(serve, tmp_path):
+    serve["payload"] = b"model bytes"
+    dest = tmp_path / "voices" / "m.onnx"
+    assert _fetch("https://x/m.onnx", dest, sha256=sha(b"model bytes")) == 11
+    assert dest.read_bytes() == b"model bytes"
+    assert list(dest.parent.glob("*.part")) == []
+
+
+def test_fetch_refuses_bytes_that_do_not_match_the_pin(serve, tmp_path):
+    serve["payload"] = b"something else entirely"
+    dest = tmp_path / "m.onnx"
+    with pytest.raises(IntegrityError):
+        _fetch("https://x/m.onnx", dest, sha256=sha(b"model bytes"))
+    # Nothing is left where the engine would load it.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetch_reports_http_errors(serve, tmp_path):
+    serve["error"] = urllib.error.HTTPError("https://x", 404, "nf", {}, None)
+    with pytest.raises(DownloadError, match="HTTP 404"):
+        _fetch("https://x/m.onnx", tmp_path / "m.onnx")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetch_explains_network_failure(serve, tmp_path):
+    serve["error"] = urllib.error.URLError("no route")
+    with pytest.raises(DownloadError, match="air-gapped"):
+        _fetch("https://x/m.onnx", tmp_path / "m.onnx")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetch_rejects_an_empty_response(serve, tmp_path):
+    serve["payload"] = b""
+    with pytest.raises(DownloadError, match="empty"):
+        _fetch("https://x/m.onnx", tmp_path / "m.onnx")
+    assert list(tmp_path.iterdir()) == []
+
+
+def make_profile(model=b"model", config=b"{}"):
+    return VoiceProfile(
+        id="v", name="v", language="en_US", gender="unspecified",
+        model="v.onnx", config="v.onnx.json",
+        model_url="https://x/v.onnx", config_url="https://x/v.onnx.json",
+        model_sha256=sha(model), config_sha256=sha(config),
+    )
+
+
+def test_download_voice_skips_files_already_present(serve, tmp_path):
+    (tmp_path / "v.onnx").write_bytes(b"model")
+    (tmp_path / "v.onnx.json").write_bytes(b"{}")
+    results = download_voice(make_profile(), tmp_path)
+    assert [r.skipped for r in results] == [True, True]
+    assert serve["urls"] == []
+
+
+def test_download_voice_force_refetches(serve, tmp_path):
+    (tmp_path / "v.onnx").write_bytes(b"old")
+    serve["payload"] = b"model"
+    profile = make_profile(model=b"model", config=b"model")
+    results = download_voice(profile, tmp_path, force=True)
+    assert [r.skipped for r in results] == [False, False]
+    assert (tmp_path / "v.onnx").read_bytes() == b"model"
+
+
+def test_download_voice_without_url_is_an_error(tmp_path):
+    profile = VoiceProfile(
+        id="v", name="v", language="en_US", gender="unspecified",
+        model="v.onnx", config="v.onnx.json",
+    )
+    with pytest.raises(DownloadError, match="no download URL"):
+        download_voice(profile, tmp_path)
+
+
+def test_verify_voice_reports_only_mismatches(tmp_path):
+    profile = make_profile()
+    (tmp_path / "v.onnx").write_bytes(b"model")
+    (tmp_path / "v.onnx.json").write_bytes(b"tampered")
+    problems = verify_voice(profile, tmp_path)
+    assert len(problems) == 1
+    assert "v.onnx.json" in problems[0]
+
+
+def test_verify_voice_ignores_unpinned_and_missing_files(tmp_path):
+    unpinned = VoiceProfile(
+        id="v", name="v", language="en_US", gender="unspecified",
+        model="v.onnx", config="v.onnx.json",
+    )
+    (tmp_path / "v.onnx").write_bytes(b"anything")
+    assert verify_voice(unpinned, tmp_path) == []
+    assert verify_voice(make_profile(), tmp_path / "empty") == []

@@ -5,7 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml calls this before it builds anything, so a tag is only ever
+  # published from a commit that passed the full matrix in that same run.
+  workflow_call:
 
+# Third-party actions are pinned by commit SHA; the trailing comment records
+# the release it corresponds to. Bump both together.
 jobs:
   test:
     name: ${{ matrix.os }} / py${{ matrix.python-version }}
@@ -14,19 +19,22 @@ jobs:
       fail-fast: false
       matrix:
         # Linux is the deployment target, so it carries the supported
-        # interpreter range. Windows and macOS are developer machines: they are
-        # here to prove the package installs and imports with Piper absent,
-        # which is the whole cross-platform contract.
+        # interpreter range -- including 3.12, where the dependency marker
+        # deliberately skips Piper. Windows and macOS are developer machines:
+        # they are here to prove the package installs and imports with Piper
+        # absent, which is the whole cross-platform contract.
         include:
           - { os: ubuntu-latest, python-version: "3.9" }
+          - { os: ubuntu-latest, python-version: "3.10" }
           - { os: ubuntu-latest, python-version: "3.11" }
+          - { os: ubuntu-latest, python-version: "3.12" }
           - { os: windows-latest, python-version: "3.11" }
           - { os: macos-latest, python-version: "3.11" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -59,16 +67,39 @@ jobs:
         run: pytest -q
 
       - name: Smoke-test the CLI
-        # doctor exits non-zero when no models are installed, which is the
-        # expected state in CI; we only care that it runs and reports.
-        run: syscon-tts doctor || true
+        # With no models installed, doctor must report the host unprovisioned
+        # and exit 1 -- exit 0 here would mean the provisioning gate is broken.
+        shell: bash
+        env:
+          SYSCON_TTS_VOICES_DIR: ${{ runner.temp }}/voices
+        run: |
+          set +e
+          syscon-tts doctor > doctor.out 2> doctor.err
+          rc=$?
+          set -e
+          cat doctor.out doctor.err
+          test "$rc" -eq 1 || { echo "::error::doctor exited $rc, expected 1"; exit 1; }
+          grep -q "voices installed  0/" doctor.out
+          grep -q "download-voices" doctor.err
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip "ruff>=0.6,<1.0"
+          ruff check src tests
 
   build:
     name: Build distributions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Build sdist and wheel
@@ -76,8 +107,4 @@ jobs:
           python -m pip install --upgrade pip build twine
           python -m build
       - name: Check metadata renders on PyPI
-        run: twine check dist/*
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
+        run: twine check --strict dist/*

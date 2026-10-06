@@ -30,13 +30,10 @@ class FakePiperVoice:
     _in_flight = 0
     _counter_lock = threading.Lock()
 
-    def __init__(self, model_path):
-        self.model_path = model_path
-
-    @classmethod
-    def load(cls, model_path, config_path=None):
-        cls.loads += 1
-        return cls(model_path)
+    def __init__(self, config, session):
+        FakePiperVoice.loads += 1
+        self.config = config
+        self.session = session
 
     def synthesize(self, text, wav_file, length_scale=1.0, sentence_silence=0.2):
         with FakePiperVoice._counter_lock:
@@ -57,14 +54,40 @@ class FakePiperVoice:
                 FakePiperVoice._in_flight -= 1
 
 
+class FakeSessionOptions:
+    def __init__(self):
+        self.intra_op_num_threads = 0
+        self.inter_op_num_threads = 0
+
+
+class FakeInferenceSession:
+    def __init__(self, model_path, sess_options=None, providers=None):
+        self.model_path = model_path
+        self.sess_options = sess_options
+        self.providers = providers
+
+
 @pytest.fixture
 def fake_piper(monkeypatch):
+    """Stand-ins for piper, piper.config and onnxruntime.
+
+    The engine builds the onnxruntime session itself (to set thread counts),
+    so all three modules are replaced, not just ``piper``.
+    """
     FakePiperVoice.loads = 0
     FakePiperVoice.peak_concurrency = 0
     FakePiperVoice._in_flight = 0
-    module = types.ModuleType("piper")
-    module.PiperVoice = FakePiperVoice
-    monkeypatch.setitem(sys.modules, "piper", module)
+    piper = types.ModuleType("piper")
+    piper.PiperVoice = FakePiperVoice
+    piper_config = types.ModuleType("piper.config")
+    piper_config.PiperConfig = types.SimpleNamespace(from_dict=lambda d: d)
+    piper.config = piper_config
+    ort = types.ModuleType("onnxruntime")
+    ort.SessionOptions = FakeSessionOptions
+    ort.InferenceSession = FakeInferenceSession
+    monkeypatch.setitem(sys.modules, "piper", piper)
+    monkeypatch.setitem(sys.modules, "piper.config", piper_config)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
     return FakePiperVoice
 
 
@@ -155,3 +178,57 @@ def test_output_is_a_wav_container(fake_piper, registry):
     audio = TTSEngine(registry).synthesize_wav("hello", "v1")
     assert audio.startswith(b"RIFF")
     assert audio[8:12] == b"WAVE"
+
+
+def test_threads_default_leaves_onnxruntime_alone(fake_piper, registry):
+    engine = TTSEngine(registry)
+    engine.preload("v1")
+    options = engine._cached("v1").session.sess_options
+    assert options.intra_op_num_threads == 0  # onnxruntime's "all cores"
+
+
+def test_threads_cap_reaches_the_session(fake_piper, registry):
+    # Without a cap, every synthesis burst saturates every core of an APU
+    # that is also doing machine monitoring.
+    engine = TTSEngine(registry, threads=2)
+    engine.preload("v1")
+    session = engine._cached("v1").session
+    assert session.sess_options.intra_op_num_threads == 2
+    assert session.sess_options.inter_op_num_threads == 1
+    assert session.providers == ["CPUExecutionProvider"]
+
+
+# -- mp3 -----------------------------------------------------------------------
+
+
+def test_mp3_without_ffmpeg_is_a_clear_error(fake_piper, registry, monkeypatch):
+    from syscon_tts import engine as engine_mod
+    from syscon_tts.engine import SynthesisError
+
+    monkeypatch.setattr(engine_mod.shutil, "which", lambda name: None)
+    with pytest.raises(SynthesisError, match="ffmpeg"):
+        TTSEngine(registry).synthesize("hi", "v1", fmt="mp3")
+
+
+def test_mp3_is_converted_through_ffmpeg(fake_piper, registry, monkeypatch):
+    from syscon_tts import engine as engine_mod
+
+    seen = {}
+
+    def fake_run(cmd, input=None, capture_output=False):
+        seen["cmd"], seen["input"] = cmd, input
+        return types.SimpleNamespace(returncode=0, stdout=b"ID3mp3", stderr=b"")
+
+    monkeypatch.setattr(engine_mod.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(engine_mod.subprocess, "run", fake_run)
+    audio, media_type = TTSEngine(registry).synthesize("hi", "v1", fmt="mp3")
+    assert (audio, media_type) == (b"ID3mp3", "audio/mpeg")
+    assert seen["cmd"][0] == "/usr/bin/ffmpeg"
+    assert seen["input"][:4] == b"RIFF"
+
+
+def test_unknown_format_is_rejected(fake_piper, registry):
+    from syscon_tts.engine import SynthesisError
+
+    with pytest.raises(SynthesisError, match="Unsupported format"):
+        TTSEngine(registry).synthesize("hi", "v1", fmt="ogg")

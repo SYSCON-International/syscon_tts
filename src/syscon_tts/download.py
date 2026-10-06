@@ -10,7 +10,8 @@ the package runs fully offline.
 
 from __future__ import annotations
 
-import shutil
+import hashlib
+import logging
 import tempfile
 import urllib.error
 import urllib.request
@@ -20,12 +21,18 @@ from typing import Callable, Iterable, Optional
 
 from .voices import VoiceProfile, VoiceRegistry, normalize_language
 
+logger = logging.getLogger("syscon_tts")
+
 #: Downloads are large (~60 MB per model); allow a generous connect timeout.
 DEFAULT_TIMEOUT = 60
 
 
 class DownloadError(Exception):
     """A voice asset could not be retrieved."""
+
+
+class IntegrityError(DownloadError):
+    """A downloaded or installed file does not match its pinned SHA-256."""
 
 
 class LicenseReviewRequired(DownloadError):
@@ -46,20 +53,54 @@ class DownloadResult:
     size: int
 
 
-def _fetch(url: str, dest: Path, timeout: int = DEFAULT_TIMEOUT) -> int:
-    """Download ``url`` to ``dest`` atomically. Returns bytes written."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".part")
+def file_sha256(path: Path) -> str:
+    """Hex SHA-256 of a file, read in chunks (models are ~60 MB)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fetch(
+    url: str,
+    dest: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    sha256: str = "",
+) -> int:
+    """Download ``url`` to ``dest`` atomically. Returns bytes written.
+
+    When ``sha256`` is given the bytes are checked before ``dest`` appears, so
+    a changed or tampered upstream file is never left where the engine would
+    load it.
+    """
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".part")
+    except PermissionError as exc:
+        raise DownloadError(
+            f"Cannot write to {dest.parent}: permission denied. Run as a user "
+            "that can write there (e.g. with sudo), or point "
+            "SYSCON_TTS_VOICES_DIR somewhere writable."
+        ) from exc
     tmp = Path(tmp_name)
     try:
         # Wrap the descriptor first so it is closed even if urlopen raises --
         # otherwise the leaked handle also blocks the cleanup unlink on Windows.
+        digest = hashlib.sha256()
         with open(fd, "wb") as handle:
             with urllib.request.urlopen(url, timeout=timeout) as response:
-                shutil.copyfileobj(response, handle)
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    handle.write(chunk)
         size = tmp.stat().st_size
         if size == 0:
             raise DownloadError(f"{url} returned an empty response.")
+        if sha256 and digest.hexdigest() != sha256.lower():
+            raise IntegrityError(
+                f"{url} does not match its pinned SHA-256 (expected {sha256}, "
+                f"got {digest.hexdigest()}). The file was not installed."
+            )
         tmp.replace(dest)
         return size
     except urllib.error.HTTPError as exc:
@@ -77,6 +118,35 @@ def _fetch(url: str, dest: Path, timeout: int = DEFAULT_TIMEOUT) -> int:
         raise
 
 
+def _assets(profile: VoiceProfile):
+    return (
+        (profile.model, profile.model_url, profile.model_sha256),
+        (profile.config, profile.config_url, profile.config_sha256),
+    )
+
+
+def verify_voice(profile: VoiceProfile, voices_dir: Path) -> list[str]:
+    """Check an installed voice against its pinned hashes.
+
+    Returns one message per file that is present but does not match. Missing
+    files and voices with no pinned hash (discovered on disk) are not
+    reported here -- install state is :meth:`VoiceRegistry.is_installed`'s job.
+    """
+    problems = []
+    for file_name, _, expected in _assets(profile):
+        path = Path(voices_dir) / file_name
+        if not expected or not path.is_file():
+            continue
+        actual = file_sha256(path)
+        if actual != expected:
+            problems.append(
+                f"{profile.id}: {file_name} does not match its pinned SHA-256 "
+                f"(expected {expected}, got {actual}). Re-fetch it with "
+                f"'syscon-tts download-voices --force {profile.id}'."
+            )
+    return problems
+
+
 def download_voice(
     profile: VoiceProfile,
     voices_dir: Path,
@@ -85,11 +155,7 @@ def download_voice(
 ) -> list[DownloadResult]:
     """Fetch the model and config for one voice profile."""
     results: list[DownloadResult] = []
-    assets = (
-        (profile.model, profile.model_url),
-        (profile.config, profile.config_url),
-    )
-    for file_name, url in assets:
+    for file_name, url, sha256 in _assets(profile):
         dest = Path(voices_dir) / file_name
         if dest.is_file() and dest.stat().st_size > 0 and not force:
             if on_progress:
@@ -105,7 +171,8 @@ def download_voice(
             )
         if on_progress:
             on_progress(f"  get  {file_name}")
-        size = _fetch(url, dest)
+        logger.info("Downloading %s for voice %s from %s", file_name, profile.id, url)
+        size = _fetch(url, dest, sha256=sha256)
         results.append(DownloadResult(profile.id, file_name, dest, False, size))
     return results
 

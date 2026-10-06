@@ -1,5 +1,6 @@
 {
   "_comment": "Curated voice catalogue. Each entry maps a stable 'id' to a Piper voice model. Ids are a durable contract - the APU stores the selected id in its settings table - so never rename one after release; add a new entry instead. To add a voice: copy an entry, set a unique id, fill model/config/model_url/config_url from https://huggingface.co/rhasspy/piper-voices, then run `syscon-tts download-voices <id>`. A site that does not want to edit this file can point SYSCON_TTS_EXTRA_MANIFEST at its own JSON (same shape) to add or replace entries, or simply drop the .onnx and .onnx.json into the voices directory, where they are discovered automatically.",
+  "_integrity": "Download URLs are pinned to one commit of rhasspy/piper-voices rather than 'main', so an upstream re-upload cannot change how a voice id sounds on newly provisioned sites. model_sha256/config_sha256 are verified after every download and by `syscon-tts doctor`; a mismatch is refused. To move to a newer upload, change the commit in both URLs and update both hashes in the same release.",
   "_licensing": "PlantStar ships to paying customers, so this catalogue only includes voices whose model card states a license permitting commercial use (public domain, CC0, Unlicense, CC BY). 'license' records what the upstream MODEL_CARD says; anything else is reported by `syscon-tts doctor` as needing review and is skipped by a bulk `download-voices`. Voices deliberately NOT catalogued: en_US-ryan, en_US-hfc_female, en_US-hfc_male and zh_CN-xiao_ya (CC BY-NC-SA, non-commercial); en_US-amy, en_GB-alan and en_US-lessac (license stated only as 'see dataset URL', unverified); zh_CN-chaowen (CC0 dataset but finetuned from the non-commercial xiao_ya). Any of them can still be used by a site that has cleared it - see DEPLOY.md.",
   "_quality": "x_low (smallest/fastest) < low < medium (balanced; the APU default) < high (largest/slowest). Medium models are roughly 60 MB on disk and in RSS.",
   "voices": [
@@ -13,8 +14,10 @@
       "license_url": "https://librivox.org",
       "model": "en_US-kristin-medium.onnx",
       "config": "en_US-kristin-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/kristin/medium/en_US-kristin-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/kristin/medium/en_US-kristin-medium.onnx.json"
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/en/en_US/kristin/medium/en_US-kristin-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/en/en_US/kristin/medium/en_US-kristin-medium.onnx.json",
+      "model_sha256": "5849957f929cbf720c258f8458692d6103fff2f0e3d3b19c8259474bb06a18d4",
+      "config_sha256": "5681426d4aead22195de70531eeeeddb46493cfaffc5764b2ea3db73428b651c"
     },
     {
       "id": "en_us_john",
@@ -26,8 +29,10 @@
       "license_url": "https://librivox.org",
       "model": "en_US-john-medium.onnx",
       "config": "en_US-john-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/john/medium/en_US-john-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/john/medium/en_US-john-medium.onnx.json"
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/en/en_US/john/medium/en_US-john-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/en/en_US/john/medium/en_US-john-medium.onnx.json",
+      "model_sha256": "789c6c875726e627ddee93d51d8727859abe9c091c3d141591f4b83c2072e988",
+      "config_sha256": "af60f177b6b550f3d7a302720c0fb89e7f94a82b5dca464775ef63b1c69ba09a"
     },
     {
       "id": "es_mx_ald",
@@ -39,8 +44,10 @@
       "license_url": "https://huggingface.co/datasets/rmcpantoja/Ald_Mexican_Spanish_speech_dataset",
       "model": "es_MX-ald-medium.onnx",
       "config": "es_MX-ald-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/ald/medium/es_MX-ald-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json"
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_MX/ald/medium/es_MX-ald-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json",
+      "model_sha256": "019b3803293c93e34a206dd2e53a3889209a514e786fd7144f7b70196c579b63",
+      "config_sha256": "5a71498158e04afc8099bfd019c7e87c68eb9d042505a2b1a87e5c1ac2b1a61d"
     },
     {
       "id": "es_es_davefx",
@@ -52,8 +59,10 @@
       "license_url": "https://github.com/OHF-Voice/voice-datasets",
       "model": "es_ES-davefx-medium.onnx",
       "config": "es_ES-davefx-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json"
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json",
+      "model_sha256": "6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917",
+      "config_sha256": "0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842"
     },
     {
       "id": "zh_cn_huayan",
@@ -65,8 +74,10 @@
       "license_url": "https://github.com/PlayVoice/HuaYan_TTS",
       "model": "zh_CN-huayan-medium.onnx",
       "config": "zh_CN-huayan-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json",
+      "model_sha256": "9929917bf8cabb26fd528ea44d3a6699c11e87317a14765312420be230be0f3d",
+      "config_sha256": "d521dc45504a8ccc99e325822b35946dd701840bfb07e3dbb31a40929ed6a82b",
       "notes": "The only Mandarin voice Piper 1.2 can run whose license is not explicitly non-commercial - but its model card states the dataset license as 'Unknown', so it needs legal sign-off before it goes to a customer. Serves both zh-Hans and zh-Hant sites: the spoken language is the same, only the script differs. Spot-check Traditional text before promising it."
     },
     {
@@ -79,8 +90,10 @@
       "license_url": "https://datashare.is.ed.ac.uk/handle/10283/2353",
       "model": "fr_FR-siwis-medium.onnx",
       "config": "fr_FR-siwis-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx.json",
+      "model_sha256": "641d1ab097da2b81128c076810edb052b385decc8be3381814802a64a73baf99",
+      "config_sha256": "39479916c2db192b5ac9764daddd0c744d83e023ad890c6976c0633ae4df8959",
       "notes": "CC BY 4.0 permits commercial use but requires attribution - credit the SIWIS corpus wherever the product credits third-party components."
     },
     {
@@ -93,8 +106,10 @@
       "license_url": "https://github.com/thorstenMueller/Thorsten-Voice",
       "model": "de_DE-thorsten-medium.onnx",
       "config": "de_DE-thorsten-medium.onnx.json",
-      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
-      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json"
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json",
+      "model_sha256": "7e64762d8e5118bb578f2eea6207e1a35a8e0c30595010b666f983fc87bb7819",
+      "config_sha256": "974adee790533adb273a1ac88f49027d2a1b8f0f2cf4905954a4791e79264e85"
     }
   ]
 }

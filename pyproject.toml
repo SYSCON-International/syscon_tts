@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syscon-tts"
-version = "0.0.3"
+version = "0.1.0"
 description = "Offline neural text-to-speech for the PlantStar APU"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,12 +31,22 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 
-# Piper ships Linux-only binary wheels (piper-phonemize has no Windows or
-# macOS distribution, and none for Python 3.12+). The marker keeps
+# Piper is installed on Linux only. piper-phonemize 1.1.0 publishes Linux
+# wheels for Python 3.9-3.11 and macOS x86_64 wheels (no Apple Silicon, no
+# Windows), and nothing for Linux on Python 3.12+. Linux is the only target we
+# test synthesis on, so the marker limits it to there. It keeps
 # `pip install syscon-tts` working everywhere: Linux hosts get a synthesis
 # engine, other platforms get a package that can still resolve, inspect, and
 # replay previously generated audio. Run `syscon-tts doctor` after installing
 # to confirm which mode you landed in.
+#
+# LICENCE: do not bump piper-tts past 1.2.x without legal review.
+#   * piper-tts 1.2.0 is MIT, but its piper-phonemize dependency bundles
+#     espeak-ng, which is GPL-3.0.
+#   * piper-tts >= 1.3 moved to OHF-voice/piper1-gpl and is GPL-3.0-or-later.
+# This package ships on customer hardware, so either change is a distribution
+# question, not a routine upgrade. tests/test_config.py fails if the pin
+# moves. See README, "Engine licensing".
 dependencies = [
     "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12'",
 ]
@@ -50,6 +60,7 @@ piper = ["piper-tts==1.2.0"]
 server = ["fastapi>=0.111,<1.0", "uvicorn[standard]>=0.30,<1.0"]
 dev = [
     "pytest>=8.2,<9",
+    "ruff>=0.6,<1.0",
     "httpx>=0.27,<1.0",
     "fastapi>=0.111,<1.0",
     "uvicorn[standard]>=0.30,<1.0",
@@ -70,6 +81,17 @@ where = ["src"]
 # The voice manifest travels inside the wheel; the models it points at are
 # downloaded at provisioning time (they are far too large to ship).
 syscon_tts = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "UP006", "UP007", "UP035", "UP045",  # keep typing.Optional/List: 3.9 is supported
+    "B008",                    # dataclass field(default_factory=...) idiom
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

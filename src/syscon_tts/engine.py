@@ -17,22 +17,28 @@ Thread safety: the APU calls this from a thread pool, because synthesis is a
 seconds-long CPU burn that must not block the Tornado IO loop. Loading is
 guarded per voice, and so is synthesis -- a single ``PiperVoice`` is not
 documented to be re-entrant, and serializing is what you want anyway on a CPU
-that has other jobs to do.
+that has other jobs to do. Within one synthesis, onnxruntime defaults to one
+thread per physical core; pass ``threads`` (``SYSCON_TTS_THREADS``) to cap it.
 """
 
 from __future__ import annotations
 
 import io
+import json
+import logging
 import platform
 import shutil
 import subprocess
 import threading
+import time
 import wave
 from collections import OrderedDict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .config import DEFAULT_MAX_LOADED_VOICES
 from .voices import VoiceNotInstalledError, VoiceProfile, VoiceRegistry
+
+logger = logging.getLogger("syscon_tts")
 
 
 class SynthesisError(Exception):
@@ -80,11 +86,13 @@ class TTSEngine:
         self,
         registry: VoiceRegistry,
         max_loaded_voices: int = DEFAULT_MAX_LOADED_VOICES,
+        threads: Optional[int] = None,
     ):
         self._registry = registry
         self._max_loaded = max(1, int(max_loaded_voices))
+        self._threads = int(threads) if threads else None
         # Least-recently-used first, so eviction pops from the front.
-        self._loaded: "OrderedDict[str, object]" = OrderedDict()
+        self._loaded: OrderedDict[str, object] = OrderedDict()
         self._voice_locks: Dict[str, threading.Lock] = {}
         # Guards the two maps above -- never held while loading or speaking.
         self._lock = threading.Lock()
@@ -114,7 +122,11 @@ class TTSEngine:
                 # Dropping a model another thread is mid-synthesis with is
                 # safe: that thread holds its own reference, and the memory is
                 # reclaimed once it finishes.
-                self._loaded.popitem(last=False)
+                evicted, _ = self._loaded.popitem(last=False)
+                logger.info(
+                    "Evicted voice %s (max_loaded_voices=%d)",
+                    evicted, self._max_loaded,
+                )
 
     def _load_voice(self, profile: VoiceProfile):
         cached = self._cached(profile.id)
@@ -145,10 +157,43 @@ class TTSEngine:
                     f"{profile.id}' to fetch it."
                 )
 
-            voice = PiperVoice.load(str(model_path), config_path=str(config_path))
+            started = time.monotonic()
+            voice = self._open_voice(PiperVoice, model_path, config_path)
+            logger.info(
+                "Loaded voice %s in %.2fs (threads=%s)",
+                profile.id, time.monotonic() - started, self._threads or "default",
+            )
 
         self._remember(profile.id, voice)
         return voice
+
+    def _open_voice(self, piper_voice, model_path, config_path):
+        """Build a ``PiperVoice`` with our own onnxruntime session options.
+
+        Mirrors ``PiperVoice.load`` from piper-tts 1.2.0, which always passes
+        a default ``SessionOptions()`` and so offers no way to cap threads.
+        Safe to reproduce because that version is pinned exactly.
+        """
+        import onnxruntime
+        from piper.config import PiperConfig
+
+        options = onnxruntime.SessionOptions()
+        if self._threads:
+            options.intra_op_num_threads = self._threads
+            options.inter_op_num_threads = 1
+        with open(config_path, encoding="utf-8") as handle:
+            config = PiperConfig.from_dict(json.load(handle))
+        session = onnxruntime.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        return piper_voice(config=config, session=session)
+
+    @property
+    def threads(self) -> Optional[int]:
+        """The per-synthesis thread cap, or None for onnxruntime's default."""
+        return self._threads
 
     def preload(self, voice_id: str) -> None:
         """Force a voice to load now (useful at startup)."""
@@ -187,6 +232,7 @@ class TTSEngine:
             # Serialize per voice: concurrent synthesis on one model has no
             # documented guarantee, and parallel CPU burn is not a win here.
             with self._voice_lock(profile.id):
+                started = time.monotonic()
                 with wave.open(buffer, "wb") as wav_file:
                     voice.synthesize(
                         text,
@@ -197,7 +243,12 @@ class TTSEngine:
         except VoiceNotInstalledError:
             raise
         except Exception as exc:  # pragma: no cover - piper runtime failure
+            logger.exception("Synthesis failed with voice %s", profile.id)
             raise SynthesisError(f"Synthesis failed: {exc}") from exc
+        logger.info(
+            "Synthesized %d chars with %s in %.2fs",
+            len(text), profile.id, time.monotonic() - started,
+        )
         return buffer.getvalue()
 
     def synthesize(
@@ -207,7 +258,7 @@ class TTSEngine:
         fmt: str = "wav",
         speed: float = 1.0,
         sentence_silence: float = 0.2,
-    ) -> "tuple[bytes, str]":
+    ) -> tuple[bytes, str]:
         """Render ``text`` and return ``(audio_bytes, media_type)``.
 
         Supported ``fmt`` values: ``wav`` (always) and ``mp3`` (requires
@@ -233,8 +284,7 @@ class TTSEngine:
             [ffmpeg, "-hide_banner", "-loglevel", "error",
              "-f", "wav", "-i", "pipe:0", "-f", "mp3", "pipe:1"],
             input=wav_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
         if proc.returncode != 0:
             raise SynthesisError(

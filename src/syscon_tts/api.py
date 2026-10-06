@@ -11,8 +11,11 @@ Endpoints:
     POST /synthesize          render text to an audio file
     GET  /                    service info
 
-Build the app with :func:`create_app`; ``app`` at module level is the default
-instance used by uvicorn / the CLI ``serve`` command.
+Build the app with :func:`create_app`. The CLI ``serve`` command runs it as a
+uvicorn factory (``syscon_tts.api:create_app --factory``). Importing this
+module does nothing else: an app is built only when asked for, so a bad
+manifest path cannot fail an import. ``syscon_tts.api:app`` still works for
+``uvicorn syscon_tts.api:app`` and builds the default app on first access.
 """
 
 from __future__ import annotations
@@ -59,7 +62,7 @@ class SynthesizeRequest(BaseModel):
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or load_settings()
     registry = VoiceRegistry.from_settings(settings)
-    engine = TTSEngine(registry, settings.max_loaded_voices)
+    engine = TTSEngine(registry, settings.max_loaded_voices, threads=settings.threads)
 
     app = FastAPI(
         title="Syscon TTS",
@@ -141,5 +144,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     return app
 
 
-# Default application instance for `uvicorn syscon_tts.api:app`.
-app = create_app()
+_default_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str):
+    """Build the default ``app`` lazily, for ``uvicorn syscon_tts.api:app``."""
+    global _default_app
+    if name == "app":
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

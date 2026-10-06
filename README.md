@@ -10,12 +10,13 @@ previous VoiceText integration.
   TTS. No GPU required.
 - **Interfaces:** a Python library (what the APU uses), a CLI, and an optional
   HTTP server.
-- **Voices:** eight voices across five languages out of the box — including
+- **Voices:** seven voices across five languages out of the box — including
   every locale the APU's UI offers — configured in a single JSON manifest, and
   extensible per deployment by dropping model files into the voices directory.
 - **Licensing:** the shipped catalogue only contains voices whose upstream
   license permits use in a product you sell. See
-  [Voices and licensing](#voices-and-licensing).
+  [Voices and licensing](https://github.com/SYSCON-International/syscon_tts/blob/main/README.md#voices-and-licensing). The engine's own licensing is
+  an open question — see [Engine licensing](https://github.com/SYSCON-International/syscon_tts/blob/main/README.md#engine-licensing).
 
 ```bash
 pip install syscon-tts
@@ -27,8 +28,12 @@ syscon-tts doctor               # confirm the install
 
 ## Platform support
 
-Piper ships **Linux-only** binary wheels. Rather than making that a hard
-install failure everywhere else, the dependency is platform-gated, so the same
+Piper depends on `piper-phonemize`, whose 1.1.0 release publishes binary
+wheels for **Linux on Python 3.9–3.11** and for Intel macOS (cp310–cp312) —
+nothing for Windows, Apple Silicon, or Linux on Python 3.12+. Linux is the only
+platform synthesis is tested on, so the dependency marker installs Piper only
+on Linux with Python < 3.12. Rather than making that a hard install failure
+everywhere else, the dependency is platform-gated, so the same
 `pip install syscon-tts` works on every platform and gives you what that
 platform can actually do:
 
@@ -69,31 +74,52 @@ synthesizer = AlertSynthesizer(
     alerts_dir=Path(settings.MEDIA_ROOT, "public_alert_sounds"),
 )
 
+# The APU needs the name up front to build the client's audio URL.
+file_name = synthesizer.file_name_for(message, language=locale)
+
 result = synthesizer.ensure(
     message,
-    file_name=file_name,     # the APU's get_valid_filename(message)[:50]
+    file_name=file_name,
     language=locale,         # optional: "es-mx", "zh-hans", ...
 )
 # result.path    -> the WAV on disk
-# result.cached  -> True if it already existed (no synthesis happened)
+# result.cached  -> True if a matching file already existed (no synthesis)
+# result.voice   -> the voice id, on a hit or a miss
 ```
 
 Two things the APU must do around this call, both covered in
-[DEPLOY.md](DEPLOY.md): run it in a thread (synthesis is a seconds-long CPU
-burn and `call_tts` is invoked from the Tornado IO loop), and apply the APU's
-own `root:www-data` ownership to `result.path` afterwards.
+[DEPLOY.md](https://github.com/SYSCON-International/syscon_tts/blob/main/DEPLOY.md):
+run it in a thread (synthesis is a seconds-long CPU burn and `call_tts` is
+invoked from the Tornado IO loop), and apply the APU's own `root:www-data`
+ownership to `result.path` afterwards.
 
-`ensure()` is **cache first**: if the WAV is already there it returns
-immediately without touching Piper. Only a cache miss synthesizes.
+**File names are unique per message.** `file_name_for()` (and `ensure()` when
+no `file_name` is given) returns the first 41 characters of the sanitized text
+— Django's `get_valid_filename` rules, so a directory listing stays readable —
+plus `_` and an 8-hex-digit hash of the full text and voice: 50 characters at
+most, the APU's existing limit. Two messages sharing a long prefix, or one
+message in two voices, never share a file. The APU must use this name rather
+than its old `get_valid_filename(message)[:50]`. An explicit `file_name` must
+be one plain path component (letters, digits, `_`, `-`, `.`), or `ensure()`
+raises `InvalidAlertNameError`.
 
-The package derives file names with the exact algorithm the APU already uses
-(`django.utils.text.get_valid_filename(text)[:50]`), verified byte-for-byte
-including Unicode and the empty-name error cases — so both sides always agree
-on the path. Passing `file_name` explicitly is still recommended, so the APU
-stays the single source of truth.
+`ensure()` is **cache first, and checks what it finds.** Every WAV it writes
+carries a fingerprint of its text, voice, speed and sentence silence in a
+standard RIFF `LIST/INFO` chunk. A file whose fingerprint matches is returned
+immediately without touching Piper; a file with a different fingerprint, or
+none (VoiceText output, or audio from syscon-tts 0.0.x), is rendered again
+rather than announced. Concurrent `ensure()` calls for the same file wait for
+each other, so N clients announcing one message render it once. Alert text is
+capped at `max_alert_chars` (1,000 by default); longer text raises
+`AlertTextTooLongError`.
 
 Full integration recipe, including the `IS_LIVE` gate, file ownership and the
-threading requirement: [DEPLOY.md](DEPLOY.md).
+threading requirement:
+[DEPLOY.md](https://github.com/SYSCON-International/syscon_tts/blob/main/DEPLOY.md).
+
+The library logs under the `syscon_tts` logger — model loads, synthesis
+timings and evictions at INFO, cache hits and misses at DEBUG, and a language
+falling back to the default voice at WARNING. Attach a handler to see them.
 
 ---
 
@@ -165,6 +191,8 @@ release of this package:
 2. **Layer a manifest.** Point `SYSCON_TTS_EXTRA_MANIFEST` at a JSON file of
    the same shape as the bundled one; new ids are added, reused ids replace the
    bundled entry. Use this when the voice should also be downloadable.
+   `model_sha256` / `config_sha256` are optional but recommended: with them,
+   downloads are verified before install and `doctor` re-checks the files.
 
 Fetch only what a site will actually speak:
 
@@ -177,11 +205,31 @@ syscon-tts download-voices --language es-mx
 
 ---
 
+## Engine licensing
+
+This package is MIT, and so is `piper-tts` 1.2.0. But `piper-tts` 1.2.0
+requires `piper-phonemize~=1.1.0`, whose wheels bundle **espeak-ng, which is
+GPL-3.0**. And `piper-tts` 1.3 and later moved to
+[OHF-voice/piper1-gpl](https://github.com/OHF-voice/piper1-gpl) and are
+**GPL-3.0-or-later** themselves.
+
+PlantStar is sold and installed on customer hardware, so shipping a
+GPL-licensed component with it is a distribution question. **That question is
+open: a legal decision is pending.** Until it is made:
+
+- `piper-tts` is pinned to exactly `1.2.0`, and must not move past 1.2.x
+  without legal review. `tests/test_config.py::test_piper_engine_stays_pinned_to_1_2_0`
+  fails if the pin changes.
+- Treat the espeak-ng component as unresolved, not cleared, when answering
+  questions about what a customer install contains.
+
+---
+
 ## CLI
 
 ```bash
-syscon-tts doctor                        # platform, Piper, model + license status
-syscon-tts download-voices               # fetch the catalogue (needs internet)
+syscon-tts doctor                        # platform, Piper, model hashes + license status
+syscon-tts download-voices               # fetch the catalogue (needs internet; SHA-256 verified)
 syscon-tts download-voices --language es-mx   # or just one site's language
 syscon-tts download-voices en_us_kristin      # or one named voice
 syscon-tts list-voices                   # catalogue, install state, licenses
@@ -192,11 +240,18 @@ syscon-tts speak -l es-mx -o aviso.wav "Presion de cavidad excedida en prensa 4.
 syscon-tts speak -v de_de_thorsten -f mp3 -o ansage.mp3 --text-file notice.txt
 
 syscon-tts alert "Press 4 cavity pressure exceeded."   # cache-first, as the APU does
+syscon-tts alert -l es-mx "Presion de cavidad excedida en prensa 4."
 syscon-tts serve --port 5002                           # needs [server] extra
+syscon-tts benchmark --threads 2                       # RTF per installed voice
+
+syscon-tts -V doctor --quick       # -V logs model loads (-VV adds cache decisions);
+                                   # --quick skips re-hashing installed models
 ```
 
-`alert` exits `2` when the audio is absent *and* this machine cannot
-synthesize — distinguishable from `1` for ordinary errors.
+`alert` exits `0` on success, `1` on an error, `2` on a usage error
+(argparse), and `69` (`EX_UNAVAILABLE`) when the audio has to be synthesized
+and this machine cannot run Piper — so a provisioning script can tell a typo
+from a platform limitation.
 
 ---
 
@@ -213,15 +268,22 @@ All optional; every one has a working default.
 | `SYSCON_TTS_DEFAULT_VOICE` | `en_us_kristin` | Voice used when none is given |
 | `SYSCON_TTS_DEFAULT_VOICES` | — | Per-language defaults, `es-mx=es_mx_ald,...` |
 | `SYSCON_TTS_MAX_LOADED_VOICES` | `3` | Voice models kept resident in memory |
+| `SYSCON_TTS_THREADS` | unset (onnxruntime's default: one per physical core) | CPU threads per synthesis |
+| `SYSCON_TTS_MAX_ALERT_CHARS` | `1000` | Max alert text length (library / `alert`) |
 | `SYSCON_TTS_FILE_MODE` | `0644` | Mode for generated audio |
 | `SYSCON_TTS_DIR_MODE` | `0755` | Mode for directories this package creates |
 | `SYSCON_TTS_HOST` | `127.0.0.1` | HTTP server bind host |
 | `SYSCON_TTS_PORT` | `5002` | HTTP server bind port |
-| `SYSCON_TTS_MAX_CHARS` | `20000` | Max text length per request |
+| `SYSCON_TTS_MAX_CHARS` | `20000` | Max text length per HTTP request |
 
-The platform data dir is `/var/lib/syscon-tts` on Linux when writable
-(otherwise `~/.local/share/syscon-tts`), `%LOCALAPPDATA%\syscon-tts` on
-Windows, and `~/Library/Application Support/syscon-tts` on macOS.
+The platform data dir on Linux is `/var/lib/syscon-tts` whenever that
+directory exists — even if the current user cannot write to it, since models
+only need to be readable — or when it can be created; otherwise
+`~/.local/share/syscon-tts` (`$XDG_DATA_HOME`). It is
+`%LOCALAPPDATA%\syscon-tts` on Windows and
+`~/Library/Application Support/syscon-tts` on macOS. `syscon-tts doctor`
+prints the data dir it chose and why; `download-voices` into a directory the
+user cannot write fails with an explicit permission error.
 
 An embedded caller that already knows its paths should skip the environment
 entirely — every setting is a constructor keyword:
@@ -229,6 +291,11 @@ entirely — every setting is a constructor keyword:
 ```python
 AlertSynthesizer(alerts_dir=..., default_voices={"zh_CN": "zh_cn_huayan"})
 ```
+
+Keywords get the same normalization as environment variables: language keys
+are normalized (`{"es-mx": ...}` becomes `es_MX`), modes may be octal strings
+(`file_mode="0644"`), and integers are coerced (`port="5002"`). Constructing
+`Settings(...)` directly validates the same way.
 
 ### Where the files go on an APU
 
@@ -290,16 +357,19 @@ pytest
 
 The full test suite passes on Windows and macOS without Piper — synthesis is
 mocked throughout, so no voice models are needed. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/SYSCON-International/syscon_tts/blob/main/CONTRIBUTING.md).
 
 ---
 
 ## Documentation
 
-- [DEPLOY.md](DEPLOY.md) — provisioning an APU, the `call_tts()` replacement,
-  air-gapped installs, tuning.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module layout, design
-  decisions, operations, troubleshooting.
+- [DEPLOY.md](https://github.com/SYSCON-International/syscon_tts/blob/main/DEPLOY.md)
+  — provisioning an APU, the `call_tts()` replacement, air-gapped installs,
+  tuning.
+- [docs/ARCHITECTURE.md](https://github.com/SYSCON-International/syscon_tts/blob/main/docs/ARCHITECTURE.md)
+  — module layout, design decisions, operations, troubleshooting.
+- [CHANGELOG.md](https://github.com/SYSCON-International/syscon_tts/blob/main/CHANGELOG.md)
+  — what changed in each release, and what an integrator has to act on.
 
 ---
 
@@ -308,18 +378,26 @@ mocked throughout, so no voice models are needed. See
 Piper runs on CPU, so throughput depends on the host. Measure on the target:
 
 ```bash
-python scripts/benchmark.py            # per-voice cold load, memory, RTF, latency
+syscon-tts benchmark               # per-voice cold load, memory, RTF, latency
+syscon-tts benchmark --threads 2   # the same, with synthesis capped at 2 threads
 ```
 
 It reports the **real-time factor** (RTF = synthesis time ÷ audio seconds) for
 short/medium/long messages. Record results with
-[docs/bench-results-template.md](docs/bench-results-template.md) and use them to
-pick quality tiers — switching a voice to its `low`-quality model in the
-manifest is the main lever on a weak CPU.
+[docs/bench-results-template.md](https://github.com/SYSCON-International/syscon_tts/blob/main/docs/bench-results-template.md)
+and use them to pick quality tiers — switching a voice to its `low`-quality
+model through an overlay manifest is the main lever on a weak CPU.
+
+By default each synthesis uses one onnxruntime thread per physical core, which
+saturates the CPU for the length of the utterance. On a host with other work
+to do, cap it with `SYSCON_TTS_THREADS` (or `threads=` as a constructor
+keyword).
 
 Expect roughly 50–120 MB resident per loaded `medium` voice; models stay in
 memory after first use to avoid reload latency.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/SYSCON-International/syscon_tts/blob/main/LICENSE).
+The speech engine's dependencies are not all MIT — see
+[Engine licensing](https://github.com/SYSCON-International/syscon_tts/blob/main/README.md#engine-licensing).

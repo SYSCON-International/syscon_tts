@@ -17,7 +17,7 @@
 #
 #     TWINE_REPOSITORY=testpypi ./upload_dist.sh
 #
-# Usage: ./upload_dist.sh
+# Usage: ./upload_dist.sh [extra twine upload options]
 
 set -euo pipefail
 
@@ -37,10 +37,12 @@ PYTHON="${PYTHON:-python}"
 # outcome -- silently uploading under the wrong token is the failure to avoid.
 export TWINE_REPOSITORY="${TWINE_REPOSITORY:-syscon_tts}"
 
-# --skip-existing matches the convention used by the other Syscon package: it
-# lets a re-run finish cleanly when some files are already uploaded. Be aware
-# it also means forgetting to bump the version fails silently rather than
-# loudly -- check `syscon-tts --version` against PyPI if an upload seems to
-# have done nothing.
-echo "Uploading dist/* using the '${TWINE_REPOSITORY}' section of ~/.pypirc"
-"$PYTHON" -m twine upload --skip-existing dist/*
+# No --skip-existing by default. With it, forgetting to bump the version
+# "succeeds" while uploading nothing. Without it PyPI refuses a file that
+# already exists and twine fails loudly, which is what you want.
+# To resume an upload that was interrupted part-way, pass it explicitly:
+#
+#     ./upload_dist.sh --skip-existing
+#
+echo "Uploading $(ls dist | tr '\n' ' ')using the '${TWINE_REPOSITORY}' section of ~/.pypirc"
+"$PYTHON" -m twine upload "$@" dist/*

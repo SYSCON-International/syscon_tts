@@ -10,15 +10,23 @@ Usage examples::
     syscon-tts speak --voice en_us_kristin --output hello.wav "Hello from PlantStar"
     syscon-tts alert --language es-mx "Presion de cavidad excedida en prensa 4."
     syscon-tts serve --host 127.0.0.1 --port 5002
+    syscon-tts benchmark --threads 2
 
 Every command except ``download-voices`` runs fully offline. ``doctor``,
-``list-voices``, and cache hits from ``alert`` work on any platform; ``speak``
-and cache misses need Piper, and therefore Linux.
+``list-voices``, and cache hits from ``alert`` work on any platform; ``speak``,
+``benchmark`` and cache misses need Piper, and therefore Linux.
+
+Exit codes: 0 success, 1 failure, 2 usage error (argparse), and
+69 (``EX_UNAVAILABLE``) when ``alert`` needs to synthesize on a host that
+cannot run Piper -- distinct from 2 so provisioning scripts can tell a typo
+from a platform limitation.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import platform
 import shutil
 import sys
@@ -26,16 +34,23 @@ from pathlib import Path
 
 from . import __version__
 from .alerts import AlertSynthesizer, InvalidAlertNameError, resolve_voice_id
-from .config import load_settings
-from .download import DownloadError, download_voices
+from .config import load_settings, resolve_data_dir
+from .download import DownloadError, download_voices, verify_voice
 from .engine import SynthesisError, SynthesisUnavailableError, TTSEngine, piper_available
 from .voices import VoiceError, VoiceRegistry
 
+#: ``alert`` could not synthesize because this host cannot run Piper.
+#: sysexits.h's EX_UNAVAILABLE; argparse already owns 2.
+EXIT_UNAVAILABLE = 69
 
-def _build_registry_and_engine():
-    settings = load_settings()
+
+def _build_registry_and_engine(threads=None):
+    settings = load_settings(threads=threads)
     registry = VoiceRegistry.from_settings(settings)
-    return settings, registry, TTSEngine(registry, settings.max_loaded_voices)
+    engine = TTSEngine(
+        registry, settings.max_loaded_voices, threads=settings.threads
+    )
+    return settings, registry, engine
 
 
 def _cmd_list_voices(args: argparse.Namespace) -> int:
@@ -81,10 +96,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  manifest          {settings.voices_manifest}")
     if settings.extra_manifest:
         print(f"  extra manifest    {settings.extra_manifest}")
+    data_dir, data_dir_reason = resolve_data_dir()
+    print(f"  data dir          {data_dir} ({data_dir_reason})")
     print(f"  voices dir        {settings.voices_dir}")
     print(f"  alerts dir        {settings.alerts_dir}")
     print(f"  audio file mode   {settings.file_mode:04o}")
     print(f"  models in memory  up to {settings.max_loaded_voices}")
+    print(f"  synthesis threads {settings.threads or 'default (all cores)'}")
     print(f"  ffmpeg (mp3)      {'yes' if shutil.which('ffmpeg') else 'no'}")
 
     has_piper = piper_available()
@@ -145,6 +163,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         problems.append(
             "No voice models on disk. Run 'syscon-tts download-voices'."
         )
+    elif not args.quick:
+        # Hashing ~60 MB per voice takes a moment, but this is the provisioning
+        # gate: a model that differs from the pinned one changes how a voice id
+        # sounds, or is something else entirely.
+        for profile in installed:
+            problems.extend(verify_voice(profile, settings.voices_dir))
 
     if problems:
         # stdout is block-buffered when piped while stderr is not, so the
@@ -230,7 +254,7 @@ def _cmd_alert(args: argparse.Namespace) -> int:
         return 1
     except SynthesisUnavailableError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_UNAVAILABLE
     except (VoiceError, SynthesisError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -253,7 +277,50 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     host = args.host or settings.host
     port = args.port or settings.port
     print(f"Starting Syscon TTS on http://{host}:{port}")
-    uvicorn.run("syscon_tts.api:app", host=host, port=port, workers=args.workers)
+    # A factory rather than a module-level app: importing syscon_tts.api must
+    # not read the environment or touch the voices directory.
+    uvicorn.run(
+        "syscon_tts.api:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=args.workers,
+    )
+    return 0
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    from . import benchmark
+
+    settings, registry, engine = _build_registry_and_engine(threads=args.threads)
+    requested = args.voices or [p.id for p in registry.installed()]
+    if not requested:
+        print(
+            "No installed voices to benchmark. Run 'syscon-tts download-voices' "
+            "first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    results = []
+    try:
+        for voice_id in requested:
+            if not registry.is_installed(registry.get(voice_id)):
+                print(f"skip {voice_id}: not installed", file=sys.stderr)
+                continue
+            results.append(benchmark.benchmark_voice(engine, voice_id, args.runs))
+    except (VoiceError, SynthesisError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(
+            {"version": __version__, "host_platform": sys.platform,
+             "threads": settings.threads, "runs": args.runs, "results": results},
+            indent=2,
+        ))
+    else:
+        benchmark.print_table(results, args.runs, settings.threads)
     return 0
 
 
@@ -264,11 +331,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version",
                         version=f"syscon-tts {__version__}")
+    parser.add_argument("-V", "--verbose", action="count", default=0,
+                        help="Log model loads and timings (-VV adds cache "
+                             "decisions).")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_doctor = sub.add_parser(
         "doctor", help="Report platform, Piper, and voice-model status."
     )
+    p_doctor.add_argument("--quick", action="store_true",
+                          help="Skip checking installed models against their "
+                               "pinned SHA-256.")
     p_doctor.set_defaults(func=_cmd_doctor)
 
     p_list = sub.add_parser("list-voices", help="List available voice profiles.")
@@ -328,12 +401,30 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Number of worker processes.")
     p_serve.set_defaults(func=_cmd_serve)
 
+    p_bench = sub.add_parser(
+        "benchmark", help="Measure load time and real-time factor per voice."
+    )
+    p_bench.add_argument("voices", nargs="*",
+                         help="Voice ids (default: all installed).")
+    p_bench.add_argument("--runs", type=int, default=3,
+                         help="Warm runs per sample; the fastest is reported.")
+    p_bench.add_argument("--threads", type=int,
+                         help="Cap synthesis threads (default: SYSCON_TTS_THREADS).")
+    p_bench.add_argument("--json", action="store_true",
+                         help="Emit JSON instead of a table.")
+    p_bench.set_defaults(func=_cmd_benchmark)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose > 1 else logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
     try:
         return args.func(args)
     except VoiceError as exc:

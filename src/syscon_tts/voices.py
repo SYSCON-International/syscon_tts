@@ -143,6 +143,10 @@ class VoiceProfile:
     config: str            # filename of the .onnx.json config
     model_url: str = ""    # download source (used by `syscon-tts download-voices`)
     config_url: str = ""
+    # Expected SHA-256 of each downloaded file. Empty means "not pinned",
+    # which is the case for voices discovered on disk.
+    model_sha256: str = ""
+    config_sha256: str = ""
     quality: str = "medium"  # x_low | low | medium | high
     # What the upstream model card states. Piper's catalogue mixes public
     # domain voices with non-commercial ones, and PlantStar ships to paying
@@ -186,6 +190,8 @@ def _profile_from_entry(entry: dict) -> VoiceProfile:
             config=entry["config"],
             model_url=entry.get("model_url", ""),
             config_url=entry.get("config_url", ""),
+            model_sha256=entry.get("model_sha256", "").lower(),
+            config_sha256=entry.get("config_sha256", "").lower(),
             quality=entry.get("quality") or quality_from_model_name(model),
             license=entry.get("license", "unknown"),
             license_url=entry.get("license_url", ""),
@@ -280,7 +286,7 @@ class VoiceRegistry:
         voices_dir: Path,
         extra_manifest: Optional[Path] = None,
         discover: bool = True,
-    ) -> "VoiceRegistry":
+    ) -> VoiceRegistry:
         """Build a registry from the manifest, an optional overlay, and disk.
 
         Later sources win on id collisions: overlay entries replace bundled
@@ -309,7 +315,7 @@ class VoiceRegistry:
         return cls(profiles, voices_dir)
 
     @classmethod
-    def from_settings(cls, settings) -> "VoiceRegistry":
+    def from_settings(cls, settings) -> VoiceRegistry:
         """Build the registry a :class:`~syscon_tts.config.Settings` describes."""
         return cls.from_manifest(
             settings.voices_manifest,

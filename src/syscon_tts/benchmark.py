@@ -1,44 +1,33 @@
-#!/usr/bin/env python3
-"""Benchmark Syscon TTS synthesis on the current host (e.g. the APU).
+"""Benchmark synthesis on the current host (``syscon-tts benchmark``).
 
-Run this AFTER deployment, inside the environment where the service runs, so
-the numbers reflect the real hardware. Requires Piper, so it only runs on
-Linux:
+Run it AFTER deployment, on the APU itself, so the numbers reflect the real
+hardware. It needs Piper, so it only runs on Linux::
 
-    source /opt/syscon-tts/.venv/bin/activate
-    python scripts/benchmark.py
+    syscon-tts benchmark
+    syscon-tts benchmark en_us_kristin en_us_john --runs 5
+    syscon-tts benchmark --threads 2          # compare against a thread cap
+    syscon-tts benchmark --json > bench-$(hostname).json
 
 For each installed voice it measures:
-  * cold load  - time to load the model into memory (first use)
-  * RTF        - real-time factor = synth_time / audio_seconds (lower is better;
-                 < 1.0 means faster than real-time)
-  * latency    - wall-clock synthesis time per sample (warm)
-  * mem        - resident memory growth from loading that voice
 
-By default it benchmarks every installed voice against three sample lengths.
-Restrict to specific voices by passing their ids, and use --json for machine
--readable output (e.g. to archive results per deployment).
+* cold load - time to load the model into memory (first use)
+* RTF       - real-time factor = synth_time / audio_seconds (lower is better;
+              < 1.0 means faster than real-time)
+* latency   - wall-clock synthesis time per sample (warm)
+* mem       - resident memory growth from loading that voice
 
-    python scripts/benchmark.py en_us_kristin en_us_john --runs 5
-    python scripts/benchmark.py --json > bench-$(hostname).json
+By default every installed voice is benchmarked against three sample lengths.
 """
 
 from __future__ import annotations
 
-import argparse
 import io
-import json
 import sys
 import time
 import wave
-from pathlib import Path
+from typing import Optional
 
-# Allow running straight from a checkout without `pip install`.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-from syscon_tts.config import load_settings  # noqa: E402
-from syscon_tts.engine import TTSEngine  # noqa: E402
-from syscon_tts.voices import VoiceRegistry  # noqa: E402
+from .engine import TTSEngine
 
 # Representative message lengths. Timing (RTF) is language-agnostic, so a single
 # English set keeps results directly comparable across all voices.
@@ -109,44 +98,9 @@ def benchmark_voice(engine: TTSEngine, voice_id: str, runs: int) -> dict:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Benchmark Syscon TTS synthesis.")
-    parser.add_argument("voices", nargs="*", help="Voice ids (default: all installed).")
-    parser.add_argument("--runs", type=int, default=3,
-                        help="Warm runs per sample; the fastest is reported (default 3).")
-    parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
-    args = parser.parse_args(argv)
-
-    settings = load_settings()
-    registry = VoiceRegistry.from_settings(settings)
-    engine = TTSEngine(registry, settings.max_loaded_voices)
-
-    if args.voices:
-        requested = args.voices
-    else:
-        requested = [v.id for v in registry.all() if registry.is_installed(v)]
-
-    if not requested:
-        print("No installed voices to benchmark. Run 'syscon-tts download-voices' first.",
-              file=sys.stderr)
-        return 1
-
-    results = []
-    for voice_id in requested:
-        profile = registry.get(voice_id)
-        if not registry.is_installed(profile):
-            print(f"skip {voice_id}: not installed", file=sys.stderr)
-            continue
-        results.append(benchmark_voice(engine, voice_id, args.runs))
-
-    if args.json:
-        print(json.dumps({"host_platform": sys.platform, "runs": args.runs,
-                          "results": results}, indent=2))
-        return 0
-
-    # Human-readable table.
+def print_table(results: list, runs: int, threads: Optional[int]) -> None:
     print(f"\nSyscon TTS benchmark  (platform={sys.platform}, "
-          f"best of {args.runs} runs)\n")
+          f"threads={threads or 'default'}, best of {runs} runs)\n")
     header = (f"{'VOICE':<16} {'COLD LOAD':>9} {'MEM':>7}  "
               f"{'SHORT RTF':>9} {'MED RTF':>8} {'LONG RTF':>9}  {'LONG LAT':>8}")
     print(header)
@@ -159,9 +113,5 @@ def main(argv: list[str] | None = None) -> int:
     print("\nRTF = synthesis_time / audio_seconds  (lower is better; < 1.0 = "
           "faster than real-time)")
     print("If RTF is uncomfortably high, switch the voice to its 'low' quality "
-          "model (see DEPLOY.md §6).")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+          "model; if the rest of the APU suffers during synthesis, cap --threads "
+          "(see DEPLOY.md, 'Tuning for the APU CPU').")

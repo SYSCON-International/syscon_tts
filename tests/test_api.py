@@ -98,5 +98,31 @@ def test_synthesize_without_piper_returns_501(client, monkeypatch):
 
 def test_missing_voice_model_returns_503(client):
     # voices_dir is an empty tmp dir, so the model genuinely is not installed.
+    # Without Piper the engine check comes first (see engine._load_voice), so
+    # which status is correct depends on the host -- but it is decidable.
     r = client.post("/synthesize", json={"text": "Hi", "voice": "en_us_kristin"})
-    assert r.status_code in (501, 503)
+    assert r.status_code == (503 if engine_mod.piper_available() else 501)
+
+
+def test_importing_the_module_builds_nothing():
+    # Importing used to build an app, which read the environment and parsed
+    # the manifest -- so a bad SYSCON_TTS_MANIFEST failed the *import*.
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, SYSCON_TTS_MANIFEST=str(Path("/nonexistent/voices.json")))
+    result = subprocess.run(
+        [sys.executable, "-c", "import syscon_tts.api"],
+        env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_default_app_is_built_on_first_access(monkeypatch, tmp_path):
+    import syscon_tts.api as api_mod
+
+    monkeypatch.setenv("SYSCON_TTS_VOICES_DIR", str(tmp_path))
+    monkeypatch.setattr(api_mod, "_default_app", None)
+    app = api_mod.app
+    assert app is api_mod.app  # cached after the first build

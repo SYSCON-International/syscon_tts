@@ -20,15 +20,30 @@ syscon-tts doctor                             # must report "Ready."
 ```
 
 `doctor` is the gate. It exits non-zero and explains the problem if Piper is
-missing on a Linux host, if no models are on disk, or if a configured voice id
-does not exist. Wire it into provisioning rather than discovering a broken TTS
-at the first alert.
+missing on a Linux host, if no models are on disk, if an installed model does
+not match its pinned SHA-256, or if a configured voice id does not exist. Wire
+it into provisioning rather than discovering a broken TTS at the first alert.
+It also prints the data directory it chose and why. Re-hashing every model
+takes a moment; `doctor --quick` skips that check for routine use.
 
-**Why the Python constraint:** Piper's `piper-phonemize` dependency ships
-prebuilt wheels only for CPython **3.9, 3.10, 3.11**, and only for Linux. On
-Python 3.12+ or on Windows/macOS the dependency marker skips it and the install
-still succeeds — you get a package that can replay cached audio but not
-generate it. See [README.md](README.md#platform-support).
+**Why the Python constraint:** Piper's `piper-phonemize` 1.1.0 dependency
+publishes Linux wheels only for CPython **3.9, 3.10, 3.11** (plus Intel-macOS
+wheels, and nothing for Windows). The dependency marker installs Piper only on
+Linux with Python < 3.12. Anywhere else the install still succeeds — you get a
+package that can replay cached audio but not generate it. See
+[README.md](README.md#platform-support).
+
+**Run provisioning as the user that can write the voices directory.** On Linux
+`/var/lib/syscon-tts` is used whenever it exists, even when the current user
+cannot write to it — models only need to be readable, so `doctor` run as an
+ordinary user still finds what `sudo` installed. `download-voices` into it
+without write access fails with an explicit permission error; re-run it with
+`sudo` (or point `SYSCON_TTS_VOICES_DIR` somewhere writable).
+
+**Downloads are pinned and verified.** Catalogue URLs point at one commit of
+`rhasspy/piper-voices` rather than `main`, and each file is checked against
+the SHA-256 in the manifest before it is installed; a mismatch is refused
+(`IntegrityError`) and the file is never put where the engine would load it.
 
 ### Where the files go
 
@@ -86,6 +101,17 @@ explicitly non-commercial, and its model card states the dataset license as
 *Unknown*. The alternatives are worse: `zh_CN-xiao_ya` is CC BY-NC-SA (and
 needs Piper ≥ 1.4), and `zh_CN-chaowen` is fine-tuned from it. Get sign-off, or
 source a Mandarin voice elsewhere.
+
+### Engine licensing
+
+The voices are not the only licence question. `piper-tts` 1.2.0 is MIT, but
+its required `piper-phonemize~=1.1.0` wheels bundle **espeak-ng (GPL-3.0)**,
+and `piper-tts` ≥ 1.3 (now `OHF-voice/piper1-gpl`) is GPL-3.0-or-later.
+Whether PlantStar can ship that on customer hardware is **open — a legal
+decision is pending.** Do not upgrade `piper-tts` past 1.2.x on an APU, and do
+not change the exact `piper-tts==1.2.0` pin, without legal review; a test
+fails if the pin moves. See the README's
+[Engine licensing](README.md#engine-licensing) section.
 
 ---
 
@@ -145,13 +171,35 @@ async def call_tts(self, message, file_name):
             None, _render_alert_audio, message, file_name, self.tts_language
         )
     except SynthesisUnavailableError:
-        # This host can never synthesize (no Piper). Any previously generated
-        # WAV is still returned by ensure(); reaching here means there was none.
+        # This host can never synthesize (no Piper). A matching previously
+        # generated WAV is still returned by ensure(); reaching here means
+        # there was none.
         logger.warning("TTS unavailable on this host for %r", file_name)
         raise
 
     self.open_files.append(file_name)
 ```
+
+The file name must come from the package too. Where
+`check_message_type_and_run_actions` builds the queue item, replace
+`get_valid_filename(message)[:50]` with:
+
+```python
+self.message_dictionary["file_name"] = _synthesizer().file_name_for(
+    self.message_dictionary["message"], language=self.tts_language
+)
+```
+
+That one value is then used for everything: the `ensure()` call above, the
+client's audio URL (`send_text_to_speech_file`), and `open_files`. Calling
+`_synthesizer()` here is cheap — it reads the manifest but loads no model.
+
+**`self.tts_language` does not exist yet** on `PublicAddressWebSocketHandler`.
+The integrator adds it: set it in `message_controller_initialization` (from
+the site's locale setting, for example), and copy it across in
+`transfer_message_controller_variables` alongside `tts_voice_name`, so the
+handler that names the file and the one that renders it agree. Pass the same
+`language` to `file_name_for()` and `ensure()`: the voice is part of the name.
 
 Three changes from the VoiceText version worth calling out:
 
@@ -165,19 +213,38 @@ Three changes from the VoiceText version worth calling out:
    about `www-data`. Apply the APU's own helper afterwards, and create the
    directory with `create_directory_at_path_and_set_ownership` during setup
    rather than letting `ensure()` create it.
-3. **`file_name` stays the APU's.** This package computes the same value
-   (`get_valid_filename(text)[:50]`, verified byte-for-byte against Django),
-   but there is no reason to have two authorities.
+3. **`file_name` comes from `file_name_for()`, not `get_valid_filename`.**
+   The package's name is the first 41 sanitized characters plus a hash of the
+   full text and voice (50 characters at most). The old `[:50]` truncation gave
+   two messages sharing a long prefix the same file, so a listener still
+   waiting to play the first heard the second. `ensure()` also refuses an
+   explicit `file_name` that is not one plain path component
+   (`InvalidAlertNameError`).
 
 The old `message.replace('"', "")` was argv hygiene for the binary. It is
-harmless now, and only affects spoken text — `get_valid_filename` strips quotes
-from the file name either way.
+harmless now, and only affects spoken text — keep it or drop it, but apply it
+the same way before `file_name_for()` and `ensure()`, since both hash the text.
 
-Note that `check_for_file_delete` unlinks each WAV once no client holds it, so
-the cache-first path rarely hits in practice. The win from a long-lived
-`AlertSynthesizer` is the **in-memory model cache**, not the file cache — call
+The file cache does real work. `main()` calls `call_tts` once **per connected
+client** for the same message, so with N clients `ensure()` renders once and
+is a cache hit the other N−1 times — and concurrent calls for the same file
+wait for the first rather than rendering N times. A hit requires the file's
+embedded fingerprint (text, voice, speed, sentence silence) to match, so a
+leftover VoiceText WAV is re-rendered, never announced. `check_for_file_delete`
+still unlinks each WAV once no client holds it. The other win from a
+long-lived `AlertSynthesizer` is the **in-memory model cache** — call
 `synthesizer.preload(language=...)` in `message_controller_initialization` to
 pay the model load at startup instead of during the first announcement.
+
+Alert text longer than `max_alert_chars` (default 1,000 characters,
+`SYSCON_TTS_MAX_ALERT_CHARS`) raises `AlertTextTooLongError`, a
+`SynthesisError`: one runaway message would otherwise hold its voice's lock
+and block every other announcement in that voice.
+
+The package logs under the `syscon_tts` logger (model loads, synthesis timings
+and evictions at INFO; cache hits/misses at DEBUG; language fallbacks at
+WARNING). The package attaches no handler of its own; give the `syscon_tts`
+logger one in the APU's logging configuration to see them.
 
 ### Choosing the voice
 
@@ -275,24 +342,30 @@ service expects; check `SYSCON_TTS_VOICES_DIR`. Synthesis then fails with a
 
 * **One utterance, one voice.** A message mixing English and Chinese is spoken
   entirely by whichever voice was selected. Split it instead.
-* **File names keep their own characters.** `get_valid_filename` is
-  Unicode-aware, so a Chinese message produces a Chinese file name. The URL the
-  APU hands the browser (`hostname + "/media/public_alert_sounds/" + name +
-  ".wav"`) therefore needs percent-encoding.
-* **The 50-character truncation counts characters, not bytes.** Fifty Han
-  characters is a much longer utterance than fifty Latin ones, so distinct
-  messages collide sooner. If that bites, pass a `file_name` with a short hash
-  suffix — the APU already controls that value.
+* **File names keep their own characters.** The sanitizing rule (Django's
+  `get_valid_filename`) is Unicode-aware, so a Chinese message produces a
+  Chinese file name. The URL the APU hands the browser (`hostname +
+  "/media/public_alert_sounds/" + name + ".wav"`) therefore needs
+  percent-encoding.
+* **The readable prefix counts characters, not bytes.** Forty-one Han
+  characters cover far more of a message than forty-one Latin ones. That no
+  longer causes collisions: the hash suffix `file_name_for()` appends covers
+  the full text and the voice, so distinct messages always get distinct files.
 
 ---
 
 ## 5. Run as a systemd service (optional)
 
-Only needed if you want the HTTP server. The APU itself does not — it imports
-the library in-process.
+Only needed if you want the HTTP server, for local tools or smoke tests. The
+APU itself does not — it imports the library in-process (§2), so a normal APU
+install has no `syscon-tts` service at all.
 
-See [`systemd/syscon-tts.service`](systemd/syscon-tts.service). Install into
-`/opt/syscon-tts`, adjust `User` and the path variables, then:
+[`systemd/syscon-tts.service`](systemd/syscon-tts.service) is a **template**.
+Every line marked `EDIT ME` is a placeholder: point `ExecStart` at the
+`syscon-tts` entry point of the Python environment the package is installed
+into on that host (the `/opt/syscon-tts/.venv` path in the file is only an
+example), and set `User`/`Group` to an unprivileged account that can read the
+voices directory. Then:
 
 ```bash
 sudo cp systemd/syscon-tts.service /etc/systemd/system/
@@ -301,8 +374,11 @@ sudo systemctl enable --now syscon-tts
 systemctl status syscon-tts
 ```
 
-The unit binds `127.0.0.1` by default. Change `SYSCON_TTS_HOST` only if
-something off-box genuinely needs to reach it.
+The unit grants no write access anywhere (`ProtectSystem=strict`, no
+`ReadWritePaths`) and sets no alerts directory: `/synthesize` returns audio in
+the response body and never writes to the alerts directory. It binds
+`127.0.0.1` by default. Change `SYSCON_TTS_HOST` only if something off-box
+genuinely needs to reach it.
 
 ---
 
@@ -328,6 +404,11 @@ Everything runs offline; only the model download needs internet.
 `pip download` must run on a host matching the APU's platform and interpreter,
 or it will fetch wheels Piper cannot use.
 
+`download-voices` on the networked machine verifies each file against the
+manifest's SHA-256, and `doctor` on the APU re-hashes the copied models
+against the same pins, so a file damaged in transit is caught there rather
+than at the first alert.
+
 Models copied in this way are picked up even if they are not in the catalogue:
 any `.onnx` + `.onnx.json` pair in the voices directory is discovered, with its
 language read from the Piper config. That is also how a site adds a
@@ -350,6 +431,12 @@ es_MX-ald-medium.onnx   ->  es_MX-ald-x_low.onnx
 .../ald/medium/...      ->  .../ald/x_low/...
 ```
 
+Then either drop `model_sha256` / `config_sha256` from the copied entry or,
+better, replace them with the new files' hashes (`sha256sum` after a first
+download). They are optional in an overlay but recommended: with them,
+`download-voices` and `doctor` verify the files; with the old values copied
+across, both would refuse them.
+
 The shipped catalogue carries only `medium` models, so a site that wants a
 lower tier adds it this way. Not every voice publishes a lower tier — check
 the voice's folder at <https://huggingface.co/rhasspy/piper-voices>.
@@ -357,6 +444,19 @@ the voice's folder at <https://huggingface.co/rhasspy/piper-voices>.
 Rule of thumb on APU-class CPUs: `medium` runs a few times faster than
 real-time; `low` is faster still with a modest quality drop. Measure on the
 actual hardware before committing.
+
+### CPU threads
+
+By default onnxruntime gives each synthesis one thread per physical core, so
+an announcement saturates the whole CPU for its length — everything else on
+the APU stalls with it. Cap it:
+
+* in the APU, with the constructor keyword: `AlertSynthesizer(..., threads=2)`;
+* everywhere else, with `SYSCON_TTS_THREADS=2`.
+
+Fewer threads means a slower render but a responsive host. Measure the
+trade-off on the actual hardware with `syscon-tts benchmark --threads N`
+(below), comparing a few values of N against the default.
 
 ### Memory
 
@@ -368,16 +468,18 @@ size for two processes.
 
 ### Benchmarking (post-deployment)
 
-`scripts/benchmark.py` measures real synthesis performance on the host it runs
-on. Run it **on the APU after deployment**. For each installed voice it reports
-cold model-load time, resident-memory growth, and the **real-time factor
+`syscon-tts benchmark` (installed with the package) measures real synthesis
+performance on the host it runs on. It needs Piper, so run it **on the APU
+after deployment**. For each installed voice it reports cold model-load time,
+resident-memory growth, and the **real-time factor
 (RTF = synth_time ÷ audio_seconds)** plus latency for short/medium/long
 messages.
 
 ```bash
-python scripts/benchmark.py                     # all installed voices
-python scripts/benchmark.py en_us_kristin --runs 5
-python scripts/benchmark.py --json > "bench-$(hostname).json"
+syscon-tts benchmark                            # all installed voices
+syscon-tts benchmark en_us_kristin --runs 5
+syscon-tts benchmark --threads 2                # with synthesis capped at 2 threads
+syscon-tts benchmark --json > "bench-$(hostname).json"
 ```
 
 Example output (format only — RTF depends entirely on the host CPU):
@@ -418,6 +520,8 @@ APU:
 | `SYSCON_TTS_DEFAULT_VOICE` | `en_us_kristin` | Voice used when none is requested |
 | `SYSCON_TTS_DEFAULT_VOICES` | — | Per-language defaults, `es-mx=es_mx_ald,...` |
 | `SYSCON_TTS_MAX_LOADED_VOICES` | `3` | Models kept resident in memory |
+| `SYSCON_TTS_THREADS` | unset (one per physical core) | CPU threads per synthesis (§7) |
+| `SYSCON_TTS_MAX_ALERT_CHARS` | `1000` | Longest alert text `ensure()` accepts |
 | `SYSCON_TTS_FILE_MODE` | `0644` | Mode for generated audio |
 | `SYSCON_TTS_EXTRA_MANIFEST` | — | Site voices layered over the catalogue |
 | `SYSCON_TTS_MANIFEST` | bundled | Replace the voice catalogue outright |
@@ -430,5 +534,10 @@ managers:
 AlertSynthesizer(
     alerts_dir=Path(settings.MEDIA_ROOT, "public_alert_sounds"),
     default_voices={"es_MX": "es_mx_ald"},
+    threads=2,
 )
 ```
+
+Keywords are normalized exactly like environment variables (`"es-mx"` keys
+become `es_MX`, `file_mode="0644"` is octal, `"5002"` becomes an int), and bad
+values raise `ValueError` at construction.

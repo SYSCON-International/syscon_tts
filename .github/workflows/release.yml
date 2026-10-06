@@ -1,49 +1,54 @@
 name: Release to PyPI
 
 # Publishes when a version tag is pushed:
-#     git tag v0.0.1 && git push origin v0.0.1
+#     git tag v0.1.0 && git push origin v0.1.0
 #
-# Authentication uses a PyPI API token, matching how django-search-filter-sort
-# is published. One-time setup:
-#   1. On PyPI, create a project-scoped API token (Account settings -> API
-#      tokens). Scope it to `syscon-tts` once the project exists; for the very
-#      first upload an account-scoped token is required, and it should be
-#      replaced with a project-scoped one afterwards.
-#   2. In this repo: Settings -> Secrets and variables -> Actions -> New
-#      repository secret, named PYPI_API_TOKEN.
+# A manual run (Actions -> Release to PyPI -> Run workflow) publishes to
+# TestPyPI only, as a rehearsal. PyPI itself is reachable only from a tag, so
+# what lands there is always a tagged commit whose version matches the tag.
+#
+# Authentication is PyPI Trusted Publishing (OIDC): no API token is stored in
+# this repository. One-time setup, done by a PyPI owner of syscon-tts:
+#   1. pypi.org -> syscon-tts -> Settings -> Publishing -> Add a GitHub
+#      publisher: owner SYSCON-International, repository syscon_tts,
+#      workflow release.yml, environment "pypi".
+#   2. The same on test.pypi.org, with environment "testpypi".
+#   3. In this repo: Settings -> Environments -> create "pypi" (add required
+#      reviewers and restrict it to v* tags) and "testpypi".
+# Once that works, delete the old PYPI_API_TOKEN secret.
 #
 # Prefer publishing from here rather than a laptop: the artifact is then built
-# from a known-clean checkout of a tagged commit, not from whatever happens to
-# be in a working directory. scripts/release.sh covers the local path when
-# needed.
+# from a known-clean checkout of a tested, tagged commit. create_dist.sh and
+# upload_dist.sh cover the local path when needed.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      repository:
-        description: "Target index"
-        required: true
-        default: testpypi
-        type: choice
-        options: [testpypi, pypi]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    name: Test
+    # The full CI matrix, run against exactly the commit being released.
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build distributions
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
       - name: Verify the tag matches the packaged version
-        # Only runs for tag pushes. A tag that disagrees with pyproject
-        # publishes a version nobody can find later, and PyPI will not let it
-        # be replaced.
+        # A tag that disagrees with pyproject publishes a version nobody can
+        # find later, and PyPI will not let it be replaced.
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           TAG="${GITHUB_REF_NAME#v}"
@@ -58,41 +63,45 @@ jobs:
         run: |
           python -m pip install --upgrade pip build twine
           python -m build
-          twine check dist/*
+          twine check --strict dist/*
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
 
-  publish:
-    name: Publish
+  publish-pypi:
+    name: Publish to PyPI
     needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/syscon-tts/
+    permissions:
+      id-token: write  # Trusted Publishing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
-      - uses: actions/setup-python@v5
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/syscon-tts/
+    permissions:
+      id-token: write  # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          python-version: "3.11"
-
-      - name: Upload
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-          # Tag pushes always go to PyPI; manual runs go wherever asked.
-          TARGET: ${{ github.event.inputs.repository || 'pypi' }}
-        run: |
-          if [ -z "$TWINE_PASSWORD" ]; then
-            echo "::error::PYPI_API_TOKEN secret is not set (see the comments in this workflow)"
-            exit 1
-          fi
-          python -m pip install --upgrade pip twine
-          if [ "$TARGET" = "testpypi" ]; then
-            twine upload --repository-url https://test.pypi.org/legacy/ dist/*
-          else
-            twine upload dist/*
-          fi
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
