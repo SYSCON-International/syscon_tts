@@ -6,7 +6,9 @@ platform: nothing here needs Piper.
 """
 
 import json
+import os
 import sys
+import time
 import types
 
 import pytest
@@ -86,6 +88,20 @@ def test_doctor_flags_a_misconfigured_default_voice(env, monkeypatch, capsys):
     monkeypatch.setenv("SYSCON_TTS_DEFAULT_VOICE", "en_us_typo")
     assert main(["doctor"]) == 1
     assert "not in the catalogue" in capsys.readouterr().err
+
+
+def test_doctor_reports_partial_downloads_without_removing_them(env, capsys):
+    voices = env / "voices"
+    voices.mkdir()
+    orphan = voices / ".syscon-tts-abc.part"
+    orphan.write_bytes(b"x" * 3_000_000)
+    stamp = time.time() - 2 * 3600
+    os.utime(orphan, (stamp, stamp))
+
+    main(["doctor", "--quick"])
+
+    assert "1 partial download(s) (3 MB)" in capsys.readouterr().out
+    assert orphan.exists()  # doctor usually runs unprivileged: report only
 
 
 def test_doctor_rejects_a_model_that_does_not_match_its_pin(env, capsys):

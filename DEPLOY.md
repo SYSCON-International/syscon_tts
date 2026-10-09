@@ -40,6 +40,11 @@ ordinary user still finds what `sudo` installed. `download-voices` into it
 without write access fails with an explicit permission error; re-run it with
 `sudo` (or point `SYSCON_TTS_VOICES_DIR` somewhere writable).
 
+An interrupted download (Ctrl-C, a dropped SSH session) leaves a partial
+`.syscon-tts-*.part` file in the voices directory. `doctor` reports these, and
+the next `download-voices` run removes any that have not been written to for
+an hour, so just rerun it.
+
 **Downloads are pinned and verified.** Catalogue URLs point at one commit of
 `rhasspy/piper-voices` rather than `main`, and each file is checked against
 the SHA-256 in the manifest before it is installed; a mismatch is refused
@@ -132,9 +137,6 @@ from pathlib import Path
 from django.conf import settings
 
 from syscon_tts import AlertSynthesizer, SynthesisUnavailableError
-from website.apps.plantstar_shared.base_app.utils.shared.directory_and_file_utils import (
-    set_root_www_data_ownership_and_permissions_for_path,
-)
 
 logger = logging.getLogger("tornado_socket_manager")
 
@@ -152,78 +154,78 @@ def _synthesizer():
     )
 
 
-def _render_alert_audio(message, file_name, language):
+def _render_alert_audio(message, language):
     """Blocking: runs in a worker thread, never on the IO loop."""
-    result = _synthesizer().ensure(
-        message, file_name=file_name, language=language
-    )
-    if not result.cached:
-        # Everything under MEDIA_ROOT is root:www-data 0770 on a live system,
-        # and the web server has to read this file back out. The helper is
-        # IS_LIVE-gated, so it is a no-op on a development box.
-        set_root_www_data_ownership_and_permissions_for_path(result.path)
-    return result
+    return _synthesizer().ensure(message, language=language)
 
 
-async def call_tts(self, message, file_name):
+async def call_tts(self, message):
+    """Render ``message`` and return the file name the audio was written to."""
     try:
-        await asyncio.get_running_loop().run_in_executor(
-            None, _render_alert_audio, message, file_name, self.tts_language
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _render_alert_audio, message, self.tts_language
         )
     except SynthesisUnavailableError:
         # This host can never synthesize (no Piper). A matching previously
         # generated WAV is still returned by ensure(); reaching here means
         # there was none.
-        logger.warning("TTS unavailable on this host for %r", file_name)
+        logger.warning("TTS unavailable on this host for %r", message)
         raise
 
-    self.open_files.append(file_name)
+    self.open_files.append(result.file_name)
+    return result.file_name
 ```
 
-The file name must come from the package too. Where
-`check_message_type_and_run_actions` builds the queue item, replace
-`get_valid_filename(message)[:50]` with:
+**Use the name `call_tts` returns** for everything downstream: the client's
+audio URL (`send_text_to_speech_file`) and `open_files`. Do not pass a
+`file_name` into `ensure()`, and do not use the name the queue item carries.
+Producers name files differently: `AlertProcessor` builds names that end in a
+UTC offset (`+00-00`), and `ensure()` does not accept `+`. Forwarding such a
+name raises `InvalidAlertNameError` on every machine alert. The APU swallows
+that exception, so those alerts would go silent. Letting the package choose
+the name avoids this, whichever producer queued the message.
 
-```python
-self.message_dictionary["file_name"] = _synthesizer().file_name_for(
-    self.message_dictionary["message"], language=self.tts_language
-)
-```
-
-That one value is then used for everything: the `ensure()` call above, the
-client's audio URL (`send_text_to_speech_file`), and `open_files`. Calling
-`_synthesizer()` here is cheap — it reads the manifest but loads no model.
+If something needs the name before the audio exists, ask the package:
+`_synthesizer().file_name_for(message, language=self.tts_language)` returns
+the name `ensure()` will use for the same text and language. It reads the
+manifest but loads no model, so it is cheap.
 
 **`self.tts_language` does not exist yet** on `PublicAddressWebSocketHandler`.
 The integrator adds it: set it in `message_controller_initialization` (from
 the site's locale setting, for example), and copy it across in
-`transfer_message_controller_variables` alongside `tts_voice_name`, so the
-handler that names the file and the one that renders it agree. Pass the same
-`language` to `file_name_for()` and `ensure()`: the voice is part of the name.
+`transfer_message_controller_variables` alongside `tts_voice_name`, so every
+handler announces in the same voice.
 
 Three changes from the VoiceText version worth calling out:
 
 1. **It must run in a thread.** `call_tts` is invoked from the async
    `send_message_to_all_web_socket_client`, so the caller becomes
-   `await self.call_tts(message, file_name)`. The old `subprocess.run` blocked
+   `file_name = await self.call_tts(message)`. The old `subprocess.run` blocked
    too, but it blocked on a *remote* VT server; Piper is one to three seconds
    of local CPU, and on the IO loop that stalls every other socket.
 2. **Ownership and permissions.** This package writes the file `0644` by
-   default (configurable with `SYSCON_TTS_FILE_MODE`), but it does not know
-   about `www-data`. Apply the APU's own helper afterwards, and create the
-   directory with `create_directory_at_path_and_set_ownership` during setup
-   rather than letting `ensure()` create it.
-3. **`file_name` comes from `file_name_for()`, not `get_valid_filename`.**
+   default (configurable with `SYSCON_TTS_FILE_MODE`). It sets the mode on the
+   open file before the rename, so the web server can read the WAV as soon as
+   it appears. Do **not** follow up with
+   `set_root_www_data_ownership_and_permissions_for_path` or any other chown
+   or chmod by path. The Tornado manager runs as root, and the alerts
+   directory is `root:www-data 0770`, so www-data can replace the new WAV with
+   a symlink between the rename and the chown. Root would then chown or chmod
+   whatever the symlink points at, such as `/etc/shadow`. The file does not
+   need www-data ownership: `0644` already lets the web server read it, and
+   root does the deleting. Create the directory with
+   `create_directory_at_path_and_set_ownership` during setup rather than
+   letting `ensure()` create it.
+3. **The file name comes from the package, not `get_valid_filename`.**
    The package's name is the first 41 sanitized characters plus a hash of the
    full text and voice (50 characters at most). The old `[:50]` truncation gave
    two messages sharing a long prefix the same file, so a listener still
-   waiting to play the first heard the second. `ensure()` also refuses an
-   explicit `file_name` that is not one plain path component
-   (`InvalidAlertNameError`).
+   waiting to play the first heard the second.
 
 The old `message.replace('"', "")` was argv hygiene for the binary. It is
 harmless now, and only affects spoken text — keep it or drop it, but apply it
-the same way before `file_name_for()` and `ensure()`, since both hash the text.
+it before `call_tts` (and before any `file_name_for()` call), since the name
+hashes the text.
 
 The file cache does real work. `main()` calls `call_tts` once **per connected
 client** for the same message, so with N clients `ensure()` renders once and
@@ -283,7 +285,7 @@ if settings.IS_LIVE or piper_available():
     ...
 ```
 
-**Do not flip `IS_LIVE` itself.** The same flag gates the `chown`/`chmod` calls
+**Do not flip `IS_LIVE` itself.** The same flag gates the APU's `chown`/`chmod` helpers
 above and module-level hardware imports in the device-interface layer; flipping
 it breaks unrelated subsystems on Windows. To test the synthesis path directly:
 

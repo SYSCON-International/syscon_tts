@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,9 @@ from syscon_tts.voices import (
     PERMISSIVE_LICENSES,
     UnknownVoiceError,
     VoiceError,
+    VoiceProfile,
     VoiceRegistry,
+    license_key,
     normalize_language,
     quality_from_model_name,
 )
@@ -121,7 +124,7 @@ def test_license_review_voices_explain_themselves():
                 f"{profile.id} needs a license review but says nothing about why"
             )
         else:
-            assert profile.license.strip().lower() in PERMISSIVE_LICENSES
+            assert license_key(profile.license) in PERMISSIVE_LICENSES
 
 
 # -- language handling -----------------------------------------------------
@@ -149,6 +152,19 @@ def test_license_review_voices_explain_themselves():
         # voice this package has never heard of.
         ("sw-ke", "sw_KE"),
         ("", ""),
+        # Separators alone hold no language; this used to raise IndexError.
+        ("-", ""),
+        ("_-_", ""),
+        # A script subtag is dropped unless an alias gives it meaning; the
+        # region after it is kept.
+        ("sr-Latn-RS", "sr_RS"),
+        ("sr-Latn", "sr"),
+        ("es-Latn-MX", "es_MX"),
+        # POSIX locale names carry a codeset and a modifier.
+        ("en_US.UTF-8", "en_US"),
+        ("es_MX@euro", "es_MX"),
+        ("de_DE.UTF-8@euro", "de_DE"),
+        (".UTF-8", ""),
     ],
 )
 def test_normalize_language(given, expected):
@@ -235,6 +251,25 @@ def test_models_on_disk_are_discovered(tmp_path):
     assert reg.for_language("ko")
 
 
+@pytest.mark.parametrize(
+    "config_bytes",
+    [b"null", b"[]", b'"text"', "{}".encode("utf-16"), b"{not json", b'{"dataset": 7}'],
+)
+def test_one_malformed_config_does_not_break_the_registry(tmp_path, config_bytes):
+    # A stray file in the voices directory must cost at most its own metadata,
+    # never every other voice: the registry backs all synthesis.
+    voices_dir = tmp_path / "voices"
+    voices_dir.mkdir()
+    (voices_dir / "ko_KO-odd-medium.onnx").write_bytes(b"not-a-real-model")
+    (voices_dir / "ko_KO-odd-medium.onnx.json").write_bytes(config_bytes)
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), voices_dir)
+
+    assert reg.has("test_voice")
+    profile = reg.get("ko_ko_odd_medium")
+    assert profile.language == "ko_KO"  # from the file name
+    assert isinstance(profile.name, str)
+
+
 def test_discovery_does_not_shadow_catalogued_voices(tmp_path):
     voices_dir = tmp_path / "voices"
     _install(voices_dir, "es_MX-ald-medium", "es_MX")
@@ -311,3 +346,191 @@ def test_public_dict_shape(tmp_path):
         "source": "manifest",
         "installed": False,
     }
+
+
+# -- licenses ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["CC-BY 4.0", "CC BY-4.0", "cc_by_4.0", "CC BY 4.0 ", "CC0-1.0", "Public-Domain",
+     "https://unlicense.org/", "The Unlicense",
+     "https://creativecommons.org/licenses/by/4.0/"],
+)
+def test_model_card_spellings_of_permissive_licenses_clear_review(spelling):
+    assert license_key(spelling) in PERMISSIVE_LICENSES
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["CC BY-NC-SA 4.0", "CC-BY-NC 4.0", "unknown", "", "see dataset URL",
+     "https://creativecommons.org/licenses/by-nc/4.0/"],
+)
+def test_restrictive_or_unknown_licenses_still_need_review(spelling):
+    assert license_key(spelling) not in PERMISSIVE_LICENSES
+
+
+def test_profile_quality_defaults_to_unknown():
+    profile = VoiceProfile(
+        id="x", name="x", language="en_US", gender="x", model="x.onnx",
+        config="x.onnx.json",
+    )
+    assert profile.quality == "unknown"
+
+
+# -- manifest validation -----------------------------------------------------
+
+
+def _entry(**overrides):
+    entry = {
+        "id": "v", "name": "V", "language": "en_US",
+        "model": "v.onnx", "config": "v.onnx.json",
+    }
+    entry.update(overrides)
+    return entry
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("model", "../../etc/cron.d/x"), ("model", "/etc/x.onnx"),
+     ("config", "sub/v.onnx.json"), ("config", "..\\v.onnx.json"),
+     ("model", "C:v.onnx"), ("model", ".."), ("model", "")],
+)
+def test_manifest_file_names_must_not_be_paths(tmp_path, field, value):
+    # download-voices runs as root and writes to voices_dir / name.
+    manifest = _write_manifest(tmp_path, voices=[_entry(**{field: value})])
+    with pytest.raises(VoiceError):
+        VoiceRegistry.from_manifest(manifest, tmp_path)
+
+
+def test_null_optional_fields_mean_not_given(tmp_path):
+    manifest = _write_manifest(tmp_path, voices=[_entry(
+        model_sha256=None, license=None, notes=None, quality=None, gender=None,
+    )])
+    profile = VoiceRegistry.from_manifest(manifest, tmp_path).get("v")
+    assert profile.model_sha256 == ""
+    assert profile.license == "unknown"
+    assert profile.gender == "unspecified"
+
+
+@pytest.mark.parametrize("digest", ["abc", "z" * 64, "a" * 63, 12])
+def test_malformed_digests_are_rejected(tmp_path, digest):
+    manifest = _write_manifest(tmp_path, voices=[_entry(model_sha256=digest)])
+    with pytest.raises(VoiceError):
+        VoiceRegistry.from_manifest(manifest, tmp_path)
+
+
+def test_digest_is_normalized_to_lower_case(tmp_path):
+    manifest = _write_manifest(tmp_path, voices=[_entry(model_sha256="AB" * 32)])
+    assert VoiceRegistry.from_manifest(manifest, tmp_path).get("v").model_sha256 == "ab" * 32
+
+
+@pytest.mark.parametrize("missing", ["id", "name", "language", "model", "config"])
+def test_missing_required_field_is_a_voice_error(tmp_path, missing):
+    entry = _entry()
+    del entry[missing]
+    manifest = _write_manifest(tmp_path, voices=[entry])
+    with pytest.raises(VoiceError, match=missing):
+        VoiceRegistry.from_manifest(manifest, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"[]", b"null", b'"voices"', b'{"voices": {}}', b'{"voices": ["v"]}',
+     b'{"voices": [null]}', b"\xff\xfe\x00garbage", b"{not json"],
+)
+def test_malformed_manifests_are_voice_errors(tmp_path, content):
+    manifest = tmp_path / "voices.json"
+    manifest.write_bytes(content)
+    with pytest.raises(VoiceError):
+        VoiceRegistry.from_manifest(manifest, tmp_path)
+
+
+def test_manifest_that_is_a_directory_is_a_voice_error(tmp_path):
+    (tmp_path / "voices.json").mkdir()
+    with pytest.raises(VoiceError):
+        VoiceRegistry.from_manifest(tmp_path / "voices.json", tmp_path)
+
+
+@pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+def test_manifest_with_a_bom_or_in_utf16_is_read(tmp_path, encoding):
+    # Windows editors add a BOM; it must not reject an otherwise good file.
+    manifest = tmp_path / "voices.json"
+    manifest.write_text(json.dumps({"voices": [_entry()]}), encoding=encoding)
+    assert VoiceRegistry.from_manifest(manifest, tmp_path).has("v")
+
+
+def test_duplicate_ids_in_one_manifest_are_an_error(tmp_path):
+    manifest = _write_manifest(
+        tmp_path, voices=[_entry(), _entry(name="Second", model="w.onnx")]
+    )
+    with pytest.raises(VoiceError, match="twice"):
+        VoiceRegistry.from_manifest(manifest, tmp_path)
+
+
+# -- discovery ---------------------------------------------------------------
+
+
+def _drop_in(voices_dir: Path, stem: str, config) -> None:
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    (voices_dir / f"{stem}.onnx").write_bytes(b"model")
+    (voices_dir / f"{stem}.onnx.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_file_name_region_beats_a_bare_config_language(tmp_path):
+    # Bare "es" would resolve to es_MX; the file name says Castilian.
+    voices = tmp_path / "voices"
+    _drop_in(voices, "es_ES-custom-medium", {"language": {"code": "es"}})
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), voices)
+    assert reg.get("es_es_custom_medium").language == "es_ES"
+
+
+def test_config_region_beats_an_unconventional_file_name(tmp_path):
+    voices = tmp_path / "voices"
+    _drop_in(voices, "plant_voice", {"language": {"code": "es_ES"}})
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), voices)
+    assert reg.get("plant_voice").language == "es_ES"
+
+
+def test_bare_config_language_beats_an_unconventional_file_name(tmp_path):
+    voices = tmp_path / "voices"
+    _drop_in(voices, "plant_voice", {"espeak": {"voice": "de"}})
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), voices)
+    assert reg.get("plant_voice").language == "de_DE"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file modes are POSIX-only")
+def test_world_writable_models_are_not_discovered(tmp_path):
+    # Anyone could have replaced it, and it would load into a root process.
+    voices = tmp_path / "voices"
+    _drop_in(voices, "ko_KO-odd-medium", {})
+    os.chmod(voices / "ko_KO-odd-medium.onnx", 0o666)
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), voices)
+    assert not reg.has("ko_ko_odd_medium")
+
+
+def test_registry_refuses_duplicate_ids(tmp_path):
+    profile = VoiceProfile(
+        id="x", name="x", language="en_US", gender="x", model="x.onnx",
+        config="x.onnx.json",
+    )
+    with pytest.raises(VoiceError):
+        VoiceRegistry([profile, profile], tmp_path)
+
+
+# -- install state -----------------------------------------------------------
+
+
+def test_empty_model_file_is_not_installed(tmp_path):
+    # An interrupted copy leaves a 0-byte file that would only fail at synthesis.
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), tmp_path)
+    (tmp_path / "test.onnx").write_bytes(b"")
+    (tmp_path / "test.onnx.json").write_text("{}", encoding="utf-8")
+    assert reg.is_installed(reg.get("test_voice")) is False
+
+
+def test_directory_named_like_a_model_is_not_installed(tmp_path):
+    reg = VoiceRegistry.from_manifest(_write_manifest(tmp_path), tmp_path)
+    (tmp_path / "test.onnx").mkdir()
+    (tmp_path / "test.onnx.json").write_text("{}", encoding="utf-8")
+    assert reg.is_installed(reg.get("test_voice")) is False

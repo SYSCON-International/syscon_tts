@@ -36,12 +36,13 @@ from collections import OrderedDict
 from typing import Dict, List, Optional
 
 from .config import DEFAULT_MAX_LOADED_VOICES
+from .errors import SysconTTSError
 from .voices import VoiceNotInstalledError, VoiceProfile, VoiceRegistry
 
-logger = logging.getLogger("syscon_tts")
+logger = logging.getLogger(__name__)
 
 
-class SynthesisError(Exception):
+class SynthesisError(SysconTTSError):
     """Raised when audio synthesis fails."""
 
 

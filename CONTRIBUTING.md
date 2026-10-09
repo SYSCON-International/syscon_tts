@@ -157,7 +157,7 @@ README, "Engine licensing".
 3. Merge to `main` with CI green.
 4. Tag that commit and push the tag:
    ```bash
-   git tag v0.0.4 && git push origin v0.0.4
+   git tag v0.0.5 && git push origin v0.0.5
    ```
 
 `release.yml` then runs the full CI matrix against the tagged commit (it calls
@@ -211,7 +211,7 @@ Do steps 1–3 of [Every release](#every-release) first, then:
 ```bash
 ./create_dist.sh
 ./upload_dist.sh
-git tag v0.0.4 && git push origin v0.0.4
+git tag v0.0.5 && git push origin v0.0.5
 ```
 
 Pushing the tag also triggers `release.yml`; its PyPI upload will then fail

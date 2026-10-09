@@ -17,6 +17,9 @@ The lookup is deliberately **cache first**:
   :class:`~syscon_tts.engine.SynthesisUnavailableError`, which callers can
   catch to degrade gracefully.
 
+That split is what lets developers on Windows/macOS exercise the full alert
+pipeline against audio generated on a Linux box, without installing Piper.
+
 "The same request" is checked, not assumed. Every WAV written here carries a
 fingerprint of its inputs in a standard RIFF ``LIST/INFO`` chunk, which
 players ignore, and a file whose fingerprint does not match -- or that has
@@ -28,9 +31,6 @@ the first 41 characters of the sanitized text, so a directory listing stays
 readable, and appends a hash of the full text and voice. Without the hash, two
 messages differing only after character 50 would share one file, and a
 listener still waiting to play the first would hear the second.
-
-That split is what lets developers on Windows/macOS exercise the full alert
-pipeline against audio generated on a Linux box, without installing Piper.
 
 A multilingual site names a language rather than a voice::
 
@@ -48,21 +48,26 @@ import logging
 import os
 import re
 import struct
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from . import tempfiles
 from .config import Settings, load_settings
 from .engine import SynthesisError, TTSEngine
+from .errors import SysconTTSError
 from .voices import UnknownVoiceError, VoiceRegistry, normalize_language
 
-logger = logging.getLogger("syscon_tts")
+logger = logging.getLogger(__name__)
 
 
-class InvalidAlertNameError(ValueError):
+class InvalidAlertNameError(SysconTTSError, ValueError):
     """Text or a supplied file name would be unsafe to write."""
+
+
+class AlertWriteError(SysconTTSError, OSError):
+    """The alerts directory or the WAV in it could not be written."""
 
 
 class AlertTextTooLongError(SynthesisError):
@@ -85,11 +90,25 @@ MAX_FILE_NAME_LEN = 50
 #: Hex digits of hash :func:`alert_file_name` appends.
 _NAME_HASH_LEN = 8
 
+#: Readable part of the name when the text sanitizes to nothing.
+_FALLBACK_NAME_PREFIX = "alert"
+
+#: Extension of every file this module writes.
+_WAV_SUFFIX = ".wav"
+
+#: Longest file name, in bytes, Linux filesystems accept (``NAME_MAX``).
+_NAME_MAX_BYTES = 255
+
+#: Locks shared out among alert paths by hash; see ``AlertSynthesizer``.
+_LOCK_STRIPES = 32
+
 
 def sanitize_file_name(text: str, max_length: int = MAX_FILE_NAME_LEN) -> str:
     """Derive a file name (no extension) from message text.
 
-    Matches ``django.utils.text.get_valid_filename(text)[:max_length]``.
+    Matches ``django.utils.text.get_valid_filename(text)[:max_length]`` for
+    any ``max_length`` of 3 or more. A shorter limit can cut a valid name
+    down to ``.`` or ``..``, which this rejects and the slice would not.
 
     The character class is Unicode-aware, so a Chinese or Spanish message keeps
     its own characters in the file name. Two consequences worth knowing when
@@ -111,6 +130,21 @@ def sanitize_file_name(text: str, max_length: int = MAX_FILE_NAME_LEN) -> str:
     return name
 
 
+def _utf8(text: str) -> bytes:
+    """``text`` as UTF-8, or :class:`InvalidAlertNameError` if it is not Unicode.
+
+    A lone surrogate (from a bad decode upstream) cannot be encoded, and
+    hashing it would otherwise escape as a bare ``UnicodeEncodeError``.
+    """
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise InvalidAlertNameError(
+            f"Text has an unpaired surrogate at position {exc.start}; it is "
+            "not valid Unicode."
+        ) from None
+
+
 def alert_file_name(text: str, voice_id: str) -> str:
     """Unique, readable file name (no extension) for one alert.
 
@@ -119,14 +153,14 @@ def alert_file_name(text: str, voice_id: str) -> str:
     messages sharing a long prefix ("... on press 4" / "... on press 7") and
     the same text in two voices never share a file.
     """
-    digest = hashlib.sha1(f"{text}|{voice_id}".encode()).hexdigest()
+    digest = hashlib.sha1(_utf8(f"{text}|{voice_id}")).hexdigest()
     prefix_len = MAX_FILE_NAME_LEN - _NAME_HASH_LEN - 1
     try:
         prefix = sanitize_file_name(text, prefix_len)
     except InvalidAlertNameError:
         # Punctuation-only text is still a valid announcement; the hash alone
         # identifies it.
-        prefix = "alert"
+        prefix = _FALLBACK_NAME_PREFIX
     return f"{prefix}_{digest[:_NAME_HASH_LEN]}"
 
 
@@ -135,7 +169,9 @@ def validate_file_name(name: str) -> str:
 
     Guards the ``file_name`` argument of :meth:`AlertSynthesizer.ensure`:
     ``../x``, ``/abs/path`` and ``C:x`` must not steer a write outside the
-    alerts directory, whoever the caller is forwarding the name from.
+    alerts directory, whoever the caller is forwarding the name from. The
+    length is checked here too, before any synthesis, rather than surfacing
+    as ``ENAMETOOLONG`` after the audio has been rendered.
     """
     if (
         not isinstance(name, str)
@@ -145,6 +181,12 @@ def validate_file_name(name: str) -> str:
         raise InvalidAlertNameError(
             f"File name {name!r} is not allowed: use letters, digits, '_', "
             "'-' and '.' only, with no path separators."
+        )
+    limit = _NAME_MAX_BYTES - len(_WAV_SUFFIX)
+    if len(name.encode("utf-8")) > limit:
+        raise InvalidAlertNameError(
+            f"File name {name[:20]!r}... is too long: at most {limit} bytes "
+            "as UTF-8."
         )
     return name
 
@@ -156,7 +198,7 @@ def request_fingerprint(
     payload = "\x00".join(
         (text, voice_id, repr(float(speed)), repr(float(sentence_silence)))
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_utf8(payload)).hexdigest()
 
 
 def resolve_voice_id(
@@ -173,6 +215,12 @@ def resolve_voice_id(
     nothing can serve falls back to the default voice rather than failing:
     an announcement in the wrong accent beats silence on a plant floor.
 
+    The same goes for a language whose voice is catalogued but not installed
+    (an es-mx site provisioned with en-us only): the default voice speaks,
+    provided *it* is installed. When it is not either -- a development box with
+    no models, replaying cached audio -- the language's own voice is kept, so
+    file names do not change with what happens to be on disk.
+
     A per-language default naming a voice that does not exist is *not* quietly
     ignored -- it surfaces as ``UnknownVoiceError`` at synthesis, because a typo
     in configuration should be visible rather than papered over.
@@ -182,18 +230,56 @@ def resolve_voice_id(
 
     if language:
         wanted = normalize_language(language)
-        configured = settings.default_voices.get(wanted)
-        if configured:
-            return configured
-        try:
-            return registry.default_for_language(wanted).id
-        except UnknownVoiceError:
-            logger.warning(
-                "No voice for language %r; falling back to default voice %s",
-                language, settings.default_voice,
+        chosen = settings.default_voices.get(wanted)
+        if not chosen:
+            try:
+                chosen = registry.default_for_language(wanted).id
+            except UnknownVoiceError:
+                _warn_once(
+                    ("no-voice", wanted, settings.default_voice),
+                    "No voice for language %r; falling back to default voice %s",
+                    language, settings.default_voice,
+                )
+        if chosen:
+            if (
+                not registry.has(chosen)  # a typo: let synthesis report it
+                or _installed(registry, chosen)
+                or not _installed(registry, settings.default_voice)
+            ):
+                return chosen
+            _warn_once(
+                ("not-installed", wanted, chosen, settings.default_voice),
+                "Voice %s for language %r is not installed; falling back to "
+                "default voice %s",
+                chosen, language, settings.default_voice,
             )
 
     return settings.default_voice
+
+
+#: Fallbacks already logged. The APU resolves a voice for file_name_for() and
+#: then once per connected client, so an unconditional warning would repeat
+#: N+1 times per announcement. Bounded because the HTTP API passes callers'
+#: language strings through here.
+_warned: set = set()
+_warned_lock = threading.Lock()
+_MAX_WARNED = 64
+
+
+def _warn_once(key: tuple, message: str, *args: Any) -> None:
+    """Log a fallback at WARNING the first time, at DEBUG after that."""
+    with _warned_lock:
+        first = key not in _warned
+        if first:
+            if len(_warned) >= _MAX_WARNED:
+                _warned.clear()
+            _warned.add(key)
+    logger.log(logging.WARNING if first else logging.DEBUG, message, *args)
+
+
+def _installed(registry: VoiceRegistry, voice_id: str) -> bool:
+    """True for a known voice whose files are on disk."""
+    return registry.has(voice_id) and registry.is_installed(registry.get(voice_id))
 
 
 @dataclass(frozen=True)
@@ -247,18 +333,26 @@ class AlertSynthesizer:
         # second finds the first's WAV instead of rendering it again -- the
         # APU calls ensure() once per connected client for the same message.
         # Striped rather than one lock per path, so the table never grows.
-        self._path_locks = [threading.Lock() for _ in range(32)]
+        self._path_locks = [threading.Lock() for _ in range(_LOCK_STRIPES)]
+        # Directories already swept for orphaned temp files.
+        self._swept: set = set()
+        self._swept_lock = threading.Lock()
 
     # -- lookup ------------------------------------------------------------
 
-    def alerts_dir(self, override: Optional[Path] = None) -> Path:
+    def _resolve_alerts_dir(self, override: Optional[Path] = None) -> Path:
+        """The per-call ``alerts_dir`` override if given, else the setting."""
         return Path(override) if override else self.settings.alerts_dir
 
     def path_for(
         self, file_name: str, alerts_dir: Optional[Path] = None
     ) -> Path:
-        """Absolute path the WAV for ``file_name`` would occupy."""
-        return self.alerts_dir(alerts_dir) / f"{validate_file_name(file_name)}.wav"
+        """Path the WAV for ``file_name`` would occupy.
+
+        Relative when the alerts directory is configured as a relative path.
+        """
+        name = validate_file_name(file_name)
+        return self._resolve_alerts_dir(alerts_dir) / f"{name}{_WAV_SUFFIX}"
 
     def file_name_for(
         self,
@@ -281,7 +375,12 @@ class AlertSynthesizer:
         voice: Optional[str] = None,
         language: Optional[str] = None,
     ) -> bool:
-        """True if a WAV for ``text`` is on disk under its derived name."""
+        """True if a WAV for ``text`` is on disk under its derived name.
+
+        Checks the name only. The file may come from a different request (another
+        speed, say), so True does not promise that :meth:`ensure` will be a
+        cache hit.
+        """
         name = self.file_name_for(text, voice, language)
         return self.path_for(name, alerts_dir).is_file()
 
@@ -311,6 +410,7 @@ class AlertSynthesizer:
     def ensure(
         self,
         text: str,
+        *,
         file_name: Optional[str] = None,
         voice: Optional[str] = None,
         alerts_dir: Optional[Path] = None,
@@ -330,10 +430,25 @@ class AlertSynthesizer:
         this request; a stale or colliding file is rendered again, never
         announced.
 
-        Raises :class:`AlertTextTooLongError` past ``max_alert_chars``,
-        :class:`InvalidAlertNameError` for an unsafe ``file_name``, and
-        :class:`~syscon_tts.engine.SynthesisUnavailableError` when the file
-        has to be rendered and this machine cannot run Piper.
+        Everything after ``text`` is keyword-only, so ``ensure(msg, name,
+        "es-mx")`` cannot pass a locale as the voice.
+
+        Every error below derives from
+        :class:`~syscon_tts.errors.SysconTTSError`:
+
+        * :class:`AlertTextTooLongError` -- ``text`` is past
+          ``max_alert_chars``.
+        * :class:`InvalidAlertNameError` -- ``file_name`` is unsafe or too
+          long, or ``text`` is not valid Unicode.
+        * :class:`~syscon_tts.voices.UnknownVoiceError` -- the voice id does
+          not exist.
+        * :class:`~syscon_tts.voices.VoiceNotInstalledError` -- the voice's
+          model files are not on disk.
+        * :class:`~syscon_tts.engine.SynthesisUnavailableError` -- the file
+          has to be rendered and this machine cannot run Piper.
+        * :class:`~syscon_tts.engine.SynthesisError` -- Piper failed.
+        * :class:`AlertWriteError` -- the directory or file could not be
+          written. It is also an ``OSError``.
         """
         if len(text) > self.settings.max_alert_chars:
             raise AlertTextTooLongError(
@@ -345,11 +460,21 @@ class AlertSynthesizer:
             name = alert_file_name(text, voice_id)
         else:
             name = validate_file_name(file_name)
-        directory = self.alerts_dir(alerts_dir)
-        dest = directory / f"{name}.wav"
+        dest = self.path_for(name, alerts_dir)
+        directory = dest.parent
         fingerprint = request_fingerprint(text, voice_id, speed, sentence_silence)
+        self._sweep_once(directory)
+
+        # First look without the lock. A hit then never waits behind another
+        # alert's seconds-long synthesis that happens to share its stripe. It
+        # is safe because files only ever appear whole, by rename.
+        if not force and read_fingerprint(dest) == fingerprint:
+            logger.debug("Cache hit: %s", dest.name)
+            return AlertAudio(path=dest, file_name=name, cached=True, voice=voice_id)
 
         with self._path_locks[hash(str(dest)) % len(self._path_locks)]:
+            # Look again: another caller may have rendered it while this one
+            # waited for the lock.
             if not force and dest.is_file():
                 if read_fingerprint(dest) == fingerprint:
                     logger.debug("Cache hit: %s", dest.name)
@@ -369,24 +494,57 @@ class AlertSynthesizer:
                 speed=speed,
                 sentence_silence=sentence_silence,
             )
-            self._ensure_directory(directory)
-            _atomic_write(
-                dest, add_fingerprint(audio, fingerprint), self.settings.file_mode
-            )
+            payload = add_fingerprint(audio, fingerprint)
+            try:
+                self._ensure_directory(directory)
+                _atomic_write(dest, payload, self.settings.file_mode)
+            except OSError as exc:
+                raise AlertWriteError(
+                    exc.errno, f"Could not write {dest}: {exc.strerror or exc}"
+                ) from exc
         return AlertAudio(path=dest, file_name=name, cached=False, voice=voice_id)
 
     def _ensure_directory(self, directory: Path) -> None:
-        """Create the alerts directory, applying the configured mode once.
+        """Create the alerts directory and any missing parents at ``dir_mode``.
 
-        The mode is applied only when this call creates the directory, so an
-        existing one keeps whatever ownership and permissions the host set --
-        on the APU that is ``root:www-data 0770``, which this package has no
-        business overwriting.
+        Only directories this call creates get the mode, so an existing one
+        keeps whatever ownership and permissions the host set. On the APU that
+        is ``root:www-data 0770``, which this package has no business
+        overwriting. ``mkdir(parents=True)`` would leave the parents at the
+        umask's mode instead.
         """
         if directory.is_dir():
             return
-        directory.mkdir(parents=True, exist_ok=True)
-        _apply_mode(directory, self.settings.dir_mode)
+        missing = []
+        current = directory
+        while not current.is_dir() and current.parent != current:
+            missing.append(current)
+            current = current.parent
+        for path in reversed(missing):
+            try:
+                # Private until the chmod below widens it, so the directory
+                # is never briefly more open than configured.
+                os.mkdir(path, 0o700)
+            except FileExistsError:
+                if path.is_dir():
+                    continue  # created concurrently; not ours to chmod
+                raise
+            _apply_dir_mode(path, self.settings.dir_mode)
+
+    def _sweep_once(self, directory: Path) -> None:
+        """Delete temp files orphaned in ``directory``, once per process.
+
+        A render killed between the temp file and the rename (SIGKILL, power
+        loss) leaves its ``.part`` file behind, and nothing else removes it:
+        the APU's cleanup only knows the names it handed out, and the backup
+        copies the whole media tree. A process start is exactly when such
+        orphans can exist, so once per directory per synthesizer is enough.
+        """
+        with self._swept_lock:
+            if directory in self._swept:
+                return
+            self._swept.add(directory)
+        tempfiles.sweep_stale(directory)
 
 
 # -- fingerprint chunk -------------------------------------------------------
@@ -396,10 +554,20 @@ class AlertSynthesizer:
 
 _FINGERPRINT_PREFIX = b"syscon-tts:"
 
+#: ``RIFF`` + 4-byte size + ``WAVE``.
+_RIFF_HEADER_LEN = 12
+
+#: 4-byte id + 4-byte little-endian size, for chunks and INFO sub-chunks.
+_CHUNK_HEADER_LEN = 8
+
+#: Largest ``LIST`` chunk read looking for a fingerprint. Ours is under 100
+#: bytes; a bigger one belongs to someone else and is skipped, not read.
+_MAX_INFO_CHUNK_LEN = 4096
+
 
 def add_fingerprint(wav: bytes, fingerprint: str) -> bytes:
     """Return ``wav`` with ``fingerprint`` appended as a ``LIST/INFO`` chunk."""
-    if len(wav) < 12 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+    if not _is_riff_wave(wav):
         raise SynthesisError("Engine did not return a RIFF/WAVE file.")
     if len(wav) % 2:
         wav += b"\x00"  # chunks start on even offsets
@@ -408,7 +576,7 @@ def add_fingerprint(wav: bytes, fingerprint: str) -> bytes:
         comment += b"\x00"
     info = b"INFO" + b"ICMT" + struct.pack("<I", len(comment)) + comment
     chunk = b"LIST" + struct.pack("<I", len(info)) + info
-    body = wav[12:] + chunk
+    body = wav[_RIFF_HEADER_LEN:] + chunk
     return b"RIFF" + struct.pack("<I", len(body) + 4) + b"WAVE" + body
 
 
@@ -420,16 +588,15 @@ def read_fingerprint(path: Path) -> Optional[str]:
     """
     try:
         with open(path, "rb") as handle:
-            header = handle.read(12)
-            if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            if not _is_riff_wave(handle.read(_RIFF_HEADER_LEN)):
                 return None
             while True:
-                chunk_header = handle.read(8)
-                if len(chunk_header) < 8:
+                chunk_header = handle.read(_CHUNK_HEADER_LEN)
+                if len(chunk_header) < _CHUNK_HEADER_LEN:
                     return None
                 chunk_id = chunk_header[:4]
                 size = struct.unpack("<I", chunk_header[4:])[0]
-                if chunk_id == b"LIST" and size <= 4096:
+                if chunk_id == b"LIST" and size <= _MAX_INFO_CHUNK_LEN:
                     found = _fingerprint_from_info(handle.read(size))
                     if found:
                         return found
@@ -440,31 +607,60 @@ def read_fingerprint(path: Path) -> Optional[str]:
         return None
 
 
+def _is_riff_wave(header: bytes) -> bool:
+    return (
+        len(header) >= _RIFF_HEADER_LEN
+        and header[:4] == b"RIFF"
+        and header[8:12] == b"WAVE"
+    )
+
+
 def _fingerprint_from_info(data: bytes) -> Optional[str]:
     if data[:4] != b"INFO":
         return None
     offset = 4
-    while offset + 8 <= len(data):
+    while offset + _CHUNK_HEADER_LEN <= len(data):
         sub_id = data[offset:offset + 4]
-        size = struct.unpack("<I", data[offset + 4:offset + 8])[0]
-        value = data[offset + 8:offset + 8 + size]
+        size = struct.unpack("<I", data[offset + 4:offset + _CHUNK_HEADER_LEN])[0]
+        start = offset + _CHUNK_HEADER_LEN
+        value = data[start:start + size]
         if sub_id == b"ICMT" and value.startswith(_FINGERPRINT_PREFIX):
             found = value[len(_FINGERPRINT_PREFIX):].rstrip(b"\x00")
             return found.decode("ascii", "replace")
-        offset += 8 + size + size % 2
+        offset = start + size + size % 2
     return None
 
 
-def _apply_mode(path: Path, mode: Optional[int]) -> None:
-    """Best-effort chmod. A no-op on Windows, and never fatal."""
-    if mode is None:
+def _apply_fd_mode(fd: int, mode: Optional[int]) -> None:
+    """Best-effort chmod through a descriptor, which no symlink can redirect.
+
+    Never by path: on the APU this runs as root in a directory www-data can
+    write. ``os.fchmod`` is POSIX-only before Python 3.13, and Windows has no
+    mode worth setting, so its absence is a no-op. Failure is never fatal --
+    a mode is not worth failing an alert over.
+    """
+    if mode is None or not hasattr(os, "fchmod"):
         return
     try:
-        os.chmod(path, mode)
+        os.fchmod(fd, mode)
     except OSError:
-        # Windows implements only the read-only bit, and on Linux the path may
-        # be owned by another account. Neither is worth failing an alert over.
         pass
+
+
+def _apply_dir_mode(path: Path, mode: Optional[int]) -> None:
+    """:func:`_apply_fd_mode` for a directory, opened without following links."""
+    flags = getattr(os, "O_DIRECTORY", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if mode is None or flags is None or nofollow is None:
+        return  # Windows
+    try:
+        fd = os.open(path, os.O_RDONLY | flags | nofollow)
+    except OSError:
+        return
+    try:
+        _apply_fd_mode(fd, mode)
+    finally:
+        os.close(fd)
 
 
 def _atomic_write(dest: Path, payload: bytes, file_mode: Optional[int]) -> None:
@@ -479,15 +675,18 @@ def _atomic_write(dest: Path, payload: bytes, file_mode: Optional[int]) -> None:
     which would leave audio the web server cannot read -- hence the explicit
     chmod before the rename rather than after, so the file is never visible at
     the wrong mode.
+
+    The chmod goes through the open descriptor, never the path. On the APU this
+    runs as root inside a directory www-data can write, so a by-path chmod
+    could be redirected through a symlink swapped in for the temp file.
     """
-    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".part")
-    tmp = Path(tmp_name)
+    fd, tmp = tempfiles.make_temp(dest.parent)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        _apply_mode(tmp, file_mode)
+            _apply_fd_mode(handle.fileno(), file_mode)
         os.replace(tmp, dest)
     except BaseException:
         tmp.unlink(missing_ok=True)

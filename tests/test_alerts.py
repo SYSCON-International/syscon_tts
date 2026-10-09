@@ -6,6 +6,7 @@ on a Linux host.
 """
 
 import io
+import logging
 import os
 import stat
 import threading
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from syscon_tts import alerts as alerts_mod
 from syscon_tts.alerts import (
     AlertSynthesizer,
     AlertTextTooLongError,
@@ -398,6 +400,28 @@ def test_generated_audio_is_readable_by_another_user(tmp_path):
 
 
 @posix_only
+def test_mode_is_set_through_the_descriptor_not_the_path(tmp_path, monkeypatch):
+    # The APU writes as root into a www-data-writable directory, where a
+    # by-path chmod can be redirected through a symlink.
+    def refuse(*args, **kwargs):
+        raise AssertionError("chmod by path")
+
+    monkeypatch.setattr(os, "chmod", refuse)
+    (tmp_path / "alerts").mkdir()
+    result = build(tmp_path).ensure("Press 4 fault")
+    assert stat.S_IMODE(result.path.stat().st_mode) == 0o644
+
+
+@posix_only
+def test_created_parent_directories_also_get_the_configured_mode(tmp_path):
+    alerts = tmp_path / "a" / "b" / "alerts"
+    synth = build(tmp_path, dir_mode=0o750)
+    synth.ensure("Press 4 fault", alerts_dir=alerts)
+    for path in (tmp_path / "a", tmp_path / "a" / "b", alerts):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o750
+
+
+@posix_only
 def test_file_mode_is_configurable(tmp_path):
     synth = build(tmp_path, file_mode=0o640)
     result = synth.ensure("Press 4 fault")
@@ -459,6 +483,62 @@ def test_unservable_language_falls_back_to_the_default_voice(tmp_path):
     assert synth.ensure("hello", language="ja-jp").voice == "en_us_kristin"
 
 
+def _install(voices_dir: Path, *models: str) -> None:
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    for model in models:
+        (voices_dir / model).write_bytes(b"model")
+        (voices_dir / f"{model}.json").write_text("{}", encoding="utf-8")
+
+
+def test_uninstalled_language_voice_falls_back_to_the_installed_default(tmp_path):
+    # An es-mx site provisioned with en-us only: speak English rather than
+    # raise VoiceNotInstalledError on every alert.
+    _install(tmp_path / "voices", "en_US-kristin-medium.onnx")
+    synth = build(tmp_path)
+    assert synth.resolve_voice(language="es-mx") == "en_us_kristin"
+    assert synth.ensure("Presion alta", language="es-mx").voice == "en_us_kristin"
+
+
+def test_uninstalled_configured_language_default_also_falls_back(tmp_path):
+    _install(tmp_path / "voices", "en_US-kristin-medium.onnx")
+    synth = build(tmp_path, default_voices={"es-mx": "es_mx_ald"})
+    assert synth.resolve_voice(language="es-mx") == "en_us_kristin"
+
+
+def test_fallback_warning_is_logged_once_not_per_call(tmp_path, caplog, monkeypatch):
+    # The APU resolves a voice for file_name_for() and again per connected
+    # client, so a per-call warning repeats N+1 times per announcement.
+    monkeypatch.setattr(alerts_mod, "_warned", set())
+    _install(tmp_path / "voices", "en_US-kristin-medium.onnx")
+    synth = build(tmp_path)
+    with caplog.at_level(logging.DEBUG, logger="syscon_tts"):
+        for _ in range(4):
+            synth.ensure("Presion alta", language="es-mx")
+    fallbacks = [r for r in caplog.records if "falling back" in r.getMessage()]
+    assert [r.levelno for r in fallbacks] == [logging.WARNING] + [logging.DEBUG] * 3
+
+
+def test_installed_language_voice_is_used(tmp_path):
+    _install(
+        tmp_path / "voices", "en_US-kristin-medium.onnx", "es_MX-ald-medium.onnx"
+    )
+    synth = build(tmp_path)
+    assert synth.resolve_voice(language="es-mx") == "es_mx_ald"
+
+
+def test_language_voice_is_kept_when_nothing_is_installed(tmp_path):
+    # A development box replaying cached audio has no models at all. Falling
+    # back there would change the voice, and with it every file name.
+    synth = build(tmp_path)
+    assert synth.resolve_voice(language="es-mx") == "es_mx_ald"
+
+
+def test_misconfigured_language_default_is_not_papered_over(tmp_path):
+    _install(tmp_path / "voices", "en_US-kristin-medium.onnx")
+    synth = build(tmp_path, default_voices={"es-mx": "es_mx_typo"})
+    assert synth.resolve_voice(language="es-mx") == "es_mx_typo"
+
+
 def test_chinese_script_tags_reach_the_mandarin_voice(tmp_path):
     synth = build(tmp_path)
     for locale in ("zh-hans", "zh-hant"):
@@ -486,3 +566,118 @@ def test_setting_overrides_replace_the_environment(tmp_path, monkeypatch):
 def test_settings_object_and_overrides_together_is_an_error(tmp_path):
     with pytest.raises(TypeError):
         AlertSynthesizer(settings=Settings(), alerts_dir=tmp_path)
+
+
+# -- errors ------------------------------------------------------------------
+
+
+def test_every_ensure_error_shares_one_base():
+    # The APU should catch one class, not a tuple that includes OSError.
+    from syscon_tts import (
+        AlertWriteError,
+        SynthesisError,
+        SysconTTSError,
+        VoiceError,
+    )
+    from syscon_tts.download import DownloadError
+
+    for cls in (
+        InvalidAlertNameError, AlertWriteError, SynthesisError, VoiceError,
+        DownloadError,
+    ):
+        assert issubclass(cls, SysconTTSError)
+    assert issubclass(AlertWriteError, OSError)  # existing handlers still work
+
+
+def test_write_failure_is_an_alert_write_error(tmp_path):
+    (tmp_path / "alerts").write_text("a file where the directory should be")
+    with pytest.raises(alerts_mod.AlertWriteError):
+        build(tmp_path).ensure("Press 4 fault")
+
+
+@pytest.mark.parametrize("call", ["ensure", "file_name_for"])
+def test_lone_surrogate_is_a_clear_error(tmp_path, call):
+    synth = build(tmp_path)
+    with pytest.raises(InvalidAlertNameError, match="surrogate"):
+        getattr(synth, call)("Press 4 \udc80 fault")
+
+
+def test_lone_surrogate_with_an_explicit_name_is_a_clear_error(tmp_path):
+    with pytest.raises(InvalidAlertNameError, match="surrogate"):
+        build(tmp_path).ensure("Press \ud800", file_name="press")
+
+
+def test_overlong_file_name_is_refused_before_synthesis(tmp_path):
+    engine = FakeEngine()
+    synth = build(tmp_path, engine)
+    with pytest.raises(InvalidAlertNameError, match="too long"):
+        synth.ensure("Press 4 fault", file_name="a" * 252)
+    # Bytes, not characters: 84 Han characters are 252 bytes of UTF-8.
+    with pytest.raises(InvalidAlertNameError, match="too long"):
+        synth.ensure("Press 4 fault", file_name="\u58d3" * 84)
+    assert engine.calls == []
+
+
+def test_longest_allowed_file_name_is_accepted(tmp_path):
+    result = build(tmp_path).ensure("Press 4 fault", file_name="a" * 251)
+    assert result.path.is_file()
+
+
+def test_ensure_options_are_keyword_only(tmp_path):
+    with pytest.raises(TypeError):
+        build(tmp_path).ensure("Press 4 fault", "name", "es-mx")
+
+
+# -- locking and housekeeping ------------------------------------------------
+
+
+def test_cache_hit_does_not_wait_for_a_busy_lock_stripe(tmp_path):
+    # Another alert rendering under the same stripe must not hold up a hit.
+    pregenerate(tmp_path, "Press 4 fault")
+    synth = build(tmp_path)
+    for lock in synth._path_locks:
+        lock.acquire()
+    results = []
+    try:
+        worker = threading.Thread(
+            target=lambda: results.append(synth.ensure("Press 4 fault"))
+        )
+        worker.start()
+        worker.join(timeout=5)
+    finally:
+        for lock in synth._path_locks:
+            lock.release()
+    assert results and results[0].cached
+
+
+def test_orphaned_temp_files_are_swept(tmp_path):
+    alerts = tmp_path / "alerts"
+    alerts.mkdir()
+    old = time.time() - 2 * 3600
+    stale = [alerts / ".syscon-tts-abc.part", alerts / "tmpxyz.part"]
+    for path in stale:
+        path.write_bytes(b"half a wav")
+        os.utime(path, (old, old))
+    fresh = alerts / ".syscon-tts-live.part"  # a render in progress
+    fresh.write_bytes(b"")
+    unrelated = alerts / "notes.part"
+    unrelated.write_bytes(b"")
+    os.utime(unrelated, (old, old))
+
+    build(tmp_path).ensure("Press 4 fault")
+
+    assert not any(path.exists() for path in stale)
+    assert fresh.exists() and unrelated.exists()
+
+
+def test_temp_files_use_the_sweepable_prefix(tmp_path, monkeypatch):
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(alerts_mod.os, "replace", spy)
+    build(tmp_path).ensure("Press 4 fault")
+    assert seen[0].startswith(".syscon-tts-") and seen[0].endswith(".part")

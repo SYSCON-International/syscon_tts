@@ -6,7 +6,7 @@ Architecture, components, deployment, operations, and interface reference.
 - **Scope:** how it is built and how it runs. For a quick start see
   [README.md](../README.md); for step-by-step deployment recipes see
   [DEPLOY.md](../DEPLOY.md).
-- **Version:** 0.0.4
+- **Version:** 0.0.5
 
 ---
 
@@ -480,7 +480,7 @@ restart. Or cap synthesis threads with `SYSCON_TTS_THREADS`. See
 | `/synthesize` → 501 | Host can never synthesize | Expected off-Linux; not retryable |
 | `/synthesize` → 404 | Bad voice id | `GET /voices` for valid ids |
 | Alert audio never appears | `alerts_dir` mismatch | Confirm it equals `MEDIA_ROOT/public_alert_sounds` |
-| Client URL 404s but `ensure()` succeeded | APU built the URL from its own `get_valid_filename(...)[:50]` | Use `file_name_for(text, language=...)` for the URL, `open_files` and `ensure()` |
+| Client URL 404s but `ensure()` succeeded | APU built the URL from its own `get_valid_filename(...)[:50]` | Use the `file_name` that `ensure()` returns (or `file_name_for(text, language=...)`) for the URL and `open_files`, and pass no `file_name` to `ensure()` |
 | `syscon-tts alert` exits `69` | Audio must be rendered and this host has no Piper (a fingerprint-less or mismatched file is a miss) | Generate the WAV on a Linux host running 0.0.4 or later (so it carries a fingerprint) with the same text and voice, and copy it across |
 | `AlertTextTooLongError` | Text over `max_alert_chars` (1000) | Shorten or split the message; raise `SYSCON_TTS_MAX_ALERT_CHARS` only deliberately |
 | `IntegrityError` on download, or `doctor` reports a SHA-256 mismatch | Upstream file changed, or a corrupt/partial copy | `syscon-tts download-voices --force <id>`; for an overlay voice, check its hashes |
@@ -507,7 +507,7 @@ embedded-caller path. Passing both a `settings` object and overrides is a
 
 | Method | Description |
 |---|---|
-| `ensure(text, file_name=None, voice=None, alerts_dir=None, speed=1.0, sentence_silence=0.2, force=False, language=None)` | Return an `AlertAudio` for `text`, synthesizing only when no file with a matching fingerprint exists. Concurrent calls for one file serialize. |
+| `ensure(text, *, file_name=None, voice=None, alerts_dir=None, speed=1.0, sentence_silence=0.2, force=False, language=None)` | Return an `AlertAudio` for `text`, synthesizing only when no file with a matching fingerprint exists. Everything after `text` is keyword-only. Concurrent renders of one file serialize; cache hits never wait on a lock. |
 | `file_name_for(text, voice=None, language=None)` | The name `ensure()` would derive (`alert_file_name(text, resolved_voice_id)`), without rendering. Pass the same `voice`/`language` as to `ensure()`. |
 | `resolve_voice(voice=None, language=None)` | The voice id a request would use, without synthesizing. |
 | `preload(voice=None, language=None)` | Load a model now; returns the voice id. Call at startup. |
@@ -532,14 +532,19 @@ is accepted.
 
 ### Errors
 
+Every exception below derives from `SysconTTSError`, so a caller that wants
+any failure from this package catches that one class.
+
 | Exception | Meaning |
 |---|---|
+| `SysconTTSError` | Base class of everything below |
 | `SynthesisUnavailableError` | Piper unusable here (expected on Windows/macOS). Subclass of `SynthesisError`. |
 | `AlertTextTooLongError` | Alert text longer than `max_alert_chars`. Subclass of `SynthesisError`. |
 | `SynthesisError` | Synthesis attempted and failed |
 | `UnknownVoiceError` | Voice id not in the manifest |
 | `VoiceNotInstalledError` | Voice known, model files absent |
-| `InvalidAlertNameError` | An explicit `file_name` is not one plain path component, or text yields no usable name (`sanitize_file_name`) |
+| `InvalidAlertNameError` | An explicit `file_name` is not one plain path component or is over 251 bytes, the text yields no usable name (`sanitize_file_name`), or the text is not valid Unicode (a lone surrogate). Also a `ValueError`. |
+| `AlertWriteError` | `ensure()` could not create the alerts directory or write the WAV. Also an `OSError`. |
 | `DownloadError` | A voice file could not be fetched |
 | `IntegrityError` | A downloaded file does not match its pinned SHA-256. Subclass of `DownloadError`. |
 | `LicenseReviewRequired` | A voice needing license review was requested without `accept_license=True`. Subclass of `DownloadError`. |
@@ -647,7 +652,7 @@ still works, because `app` is built lazily on first access.
 
 ### `GET /`
 ```json
-{"service":"Syscon TTS","version":"0.0.4","engine":"piper",
+{"service":"Syscon TTS","version":"0.0.5","engine":"piper",
  "default_voice":"en_us_kristin","endpoints":["/health","/voices","/synthesize"]}
 ```
 

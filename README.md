@@ -74,14 +74,11 @@ synthesizer = AlertSynthesizer(
     alerts_dir=Path(settings.MEDIA_ROOT, "public_alert_sounds"),
 )
 
-# The APU needs the name up front to build the client's audio URL.
-file_name = synthesizer.file_name_for(message, language=locale)
-
 result = synthesizer.ensure(
     message,
-    file_name=file_name,
     language=locale,         # optional: "es-mx", "zh-hans", ...
 )
+# result.file_name -> the name to build the client's audio URL from
 # result.path    -> the WAV on disk
 # result.cached  -> True if a matching file already existed (no synthesis)
 # result.voice   -> the voice id, on a hit or a miss
@@ -90,8 +87,10 @@ result = synthesizer.ensure(
 Two things the APU must do around this call, both covered in
 [DEPLOY.md](https://github.com/SYSCON-International/syscon_tts/blob/main/DEPLOY.md):
 run it in a thread (synthesis is a seconds-long CPU burn and `call_tts` is
-invoked from the Tornado IO loop), and apply the APU's own `root:www-data`
-ownership to `result.path` afterwards.
+invoked from the Tornado IO loop), and use `result.file_name` rather than a
+name of its own. Do not chown or chmod `result.path` afterwards: the file is
+already readable, and a root chown by path in a www-data-writable directory is
+a privilege escalation.
 
 **File names are unique per message.** `file_name_for()` (and `ensure()` when
 no `file_name` is given) returns the first 41 characters of the sanitized text

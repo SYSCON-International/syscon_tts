@@ -12,7 +12,9 @@ its ``.onnx.json`` config. Profiles come from two places:
   directory that no manifest entry claims. This is what makes a deployment's
   voice set its own: drop in a model from
   <https://huggingface.co/rhasspy/piper-voices> (or one you trained) and it is
-  selectable immediately, with no new release of this package.
+  selectable the next time a registry is built, with no new release of this
+  package. The CLI builds one per command, so it sees the file at once; a
+  long-running process (the APU, the HTTP server) needs a restart.
 
 Voice ids are a durable contract -- the APU stores the selected id in its
 settings table -- so ids in the manifest must never be renamed once released.
@@ -24,9 +26,20 @@ works on every platform regardless of whether Piper is installed.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import re
+import stat
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+
+from .errors import SysconTTSError
+
+if TYPE_CHECKING:  # config imports this module, so only for annotations
+    from .config import Settings
+
+logger = logging.getLogger(__name__)
 
 #: Locale spellings that should collapse onto one voice language. The Spanish
 #: and Chinese entries are product decisions, not linguistics: PlantStar offers
@@ -47,30 +60,77 @@ _LANGUAGE_ALIASES = {
     "cmn": "zh_CN",
 }
 
-#: Script subtags that carry no voice-selection meaning for us (``zh-Hant-TW``
-#: and ``zh-Hans-CN`` are the same Piper voice).
-_SCRIPT_SUBTAGS = frozenset({"hans", "hant", "latn", "cyrl", "arab"})
-
 #: Piper's quality tiers, largest first.
 QUALITY_ORDER = ("high", "medium", "low", "x_low")
 
-#: Upstream license strings that clear a voice for use in a product we sell.
-#: ``site-supplied`` covers voices discovered on disk: whoever put the file
-#: there made that call, and second-guessing it would only produce warnings
-#: nobody can act on. Compared case-insensitively after stripping.
+#: Upstream license strings that clear a voice for use in a product we sell,
+#: in the form :func:`license_key` produces. ``site supplied`` covers voices
+#: discovered on disk: whoever put the file there made that call, and
+#: second-guessing it would only produce warnings nobody can act on. Model
+#: cards spell these many ways (``CC-BY 4.0``, ``CC BY-4.0``, a license URL),
+#: which is why they are compared normalized rather than verbatim.
 PERMISSIVE_LICENSES = frozenset(
     {
         "public domain",
         "cc0",
+        "cc0 1.0",
+        "creativecommons.org/publicdomain/zero/1.0",
         "unlicense",
+        "the unlicense",
+        "unlicense.org",
         "cc by 4.0",
-        "cc-by-4.0",
-        "site-supplied",
+        "creativecommons.org/licenses/by/4.0",
+        "site supplied",
     }
 )
 
 
-class VoiceError(Exception):
+def license_key(text: str) -> str:
+    """Normalize a license string for comparison with :data:`PERMISSIVE_LICENSES`.
+
+    Lower-cases, drops a URL's scheme, ``www.`` and trailing slash, and treats
+    ``-`` and ``_`` as spaces: ``"CC-BY 4.0"``, ``"cc_by_4.0"`` and
+    ``"CC BY 4.0"`` all become ``"cc by 4.0"``.
+    """
+    key = str(text or "").strip().lower()
+    key = re.sub(r"^https?://", "", key)
+    key = re.sub(r"^www\.", "", key).rstrip("/")
+    if "/" not in key:  # leave URL paths alone; they use '-' meaningfully
+        key = re.sub(r"[-_\s]+", " ", key)
+    return key
+
+
+def _is_script(subtag: str) -> bool:
+    """BCP-47 script subtags are exactly four letters (``Latn``, ``Hant``)."""
+    return len(subtag) == 4 and subtag.isalpha()
+
+
+def _locale_parts(code: Any) -> List[str]:
+    """Lower-cased subtags of a locale, minus POSIX codeset and modifier.
+
+    ``"en_US.UTF-8"`` and ``"es_MX@euro"`` lose ``.UTF-8`` and ``@euro``.
+    """
+    text = str(code or "").strip().split("@", 1)[0].split(".", 1)[0]
+    return [part for part in text.lower().replace("-", "_").split("_") if part]
+
+
+def _has_region(code: Any) -> bool:
+    """True when a locale names a region (``es-ES``, ``sr-Latn-RS``), not just a language."""
+    parts = _locale_parts(code)
+    if len(parts) >= 2 and _is_script(parts[1]):
+        parts = parts[:1] + parts[2:]
+    # BCP-47 shapes, so a file stem like "plant_voice" is not read as one.
+    return (
+        len(parts) >= 2
+        and 2 <= len(parts[0]) <= 3 and parts[0].isalpha()
+        and (
+            (len(parts[1]) == 2 and parts[1].isalpha())
+            or (len(parts[1]) == 3 and parts[1].isdigit())
+        )
+    )
+
+
+class VoiceError(SysconTTSError):
     """Base class for voice-related errors."""
 
 
@@ -86,31 +146,33 @@ def normalize_language(code: str) -> str:
     """Canonicalize a locale into the catalogue's spelling.
 
     ``"en-us"``, ``"en_US"`` and ``"en"`` all become ``"en_US"``; ``"zh-hans"``
-    and ``"zh-Hant-TW"`` both become ``"zh_CN"``. Unrecognized codes are
-    returned in ``lang_REGION`` form rather than rejected, so a site can add a
-    voice for a language this package has never heard of.
+    and ``"zh-Hant-TW"`` both become ``"zh_CN"``. A script subtag is dropped
+    unless an alias gives it meaning (``sr-Latn-RS`` -> ``sr_RS``), and so are
+    a POSIX codeset and modifier (``en_US.UTF-8``, ``es_MX@euro``).
+    Unrecognized codes are returned in ``lang_REGION`` form rather than
+    rejected, so a site can add a voice for a language this package has never
+    heard of.
     """
-    text = str(code or "").strip().replace("-", "_")
-    if not text:
+    parts = _locale_parts(code)
+    if not parts:
+        # Empty, or separators only ("-", "_"): there is no language in it.
         return ""
 
-    key = text.lower()
+    key = "_".join(parts)
     if key in _LANGUAGE_ALIASES:
         return _LANGUAGE_ALIASES[key]
 
-    parts = [part for part in key.split("_") if part]
-    language = parts[0]
-
-    if len(parts) >= 2 and parts[1] in _SCRIPT_SUBTAGS:
-        scripted = f"{language}_{parts[1]}"
+    language, rest = parts[0], parts[1:]
+    if rest and _is_script(rest[0]):
+        scripted = f"{language}_{rest[0]}"
         if scripted in _LANGUAGE_ALIASES:
             return _LANGUAGE_ALIASES[scripted]
-        return _LANGUAGE_ALIASES.get(language, language)
+        rest = rest[1:]
 
-    if len(parts) == 1:
+    if not rest:
         return _LANGUAGE_ALIASES.get(language, language)
-
-    return _LANGUAGE_ALIASES.get(f"{language}_{parts[1]}", f"{language}_{parts[1].upper()}")
+    region = rest[0]
+    return _LANGUAGE_ALIASES.get(f"{language}_{region}", f"{language}_{region.upper()}")
 
 
 def primary_language(code: str) -> str:
@@ -147,7 +209,7 @@ class VoiceProfile:
     # which is the case for voices discovered on disk.
     model_sha256: str = ""
     config_sha256: str = ""
-    quality: str = "medium"  # x_low | low | medium | high
+    quality: str = "unknown"  # x_low | low | medium | high | unknown
     # What the upstream model card states. Piper's catalogue mixes public
     # domain voices with non-commercial ones, and PlantStar ships to paying
     # customers, so this is tracked per voice rather than assumed.
@@ -162,7 +224,7 @@ class VoiceProfile:
     @property
     def requires_license_review(self) -> bool:
         """True when this voice must not ship to a customer unreviewed."""
-        return self.license.strip().lower() not in PERMISSIVE_LICENSES
+        return license_key(self.license) not in PERMISSIVE_LICENSES
 
     def to_public_dict(self, installed: bool) -> dict:
         return {
@@ -178,40 +240,118 @@ class VoiceProfile:
         }
 
 
-def _profile_from_entry(entry: dict) -> VoiceProfile:
-    try:
-        model = entry["model"]
-        return VoiceProfile(
-            id=entry["id"],
-            name=entry["name"],
-            language=normalize_language(entry["language"]),
-            gender=entry.get("gender", "unspecified"),
-            model=model,
-            config=entry["config"],
-            model_url=entry.get("model_url", ""),
-            config_url=entry.get("config_url", ""),
-            model_sha256=entry.get("model_sha256", "").lower(),
-            config_sha256=entry.get("config_sha256", "").lower(),
-            quality=entry.get("quality") or quality_from_model_name(model),
-            license=entry.get("license", "unknown"),
-            license_url=entry.get("license_url", ""),
-            notes=entry.get("notes", ""),
-        )
-    except KeyError as exc:  # pragma: no cover - manifest authoring error
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _required(entry: dict, key: str) -> str:
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
         raise VoiceError(
-            f"Voice manifest entry missing required field {exc}: {entry!r}"
-        ) from exc
+            f"Voice manifest entry needs a non-empty string {key!r}: {entry!r}"
+        )
+    return value
+
+
+def _optional(entry: dict, key: str, default: str = "") -> str:
+    """A string field; JSON ``null`` means "not given"."""
+    value = entry.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise VoiceError(f"Voice manifest field {key!r} must be a string: {entry!r}")
+    return value
+
+
+def _file_name(entry: dict, key: str) -> str:
+    """A model/config name: one plain file name inside the voices directory.
+
+    ``download-voices`` runs as root and writes to ``voices_dir / name``, so
+    ``../x`` or an absolute path would let a manifest write anywhere.
+    """
+    name = _required(entry, key)
+    if (
+        name in (".", "..")
+        or PurePosixPath(name).name != name
+        or PureWindowsPath(name).name != name
+    ):
+        raise VoiceError(
+            f"Voice manifest field {key!r} must be a plain file name, not a "
+            f"path: {name!r}"
+        )
+    return name
+
+
+def _sha256(entry: dict, key: str) -> str:
+    value = _optional(entry, key).strip().lower()
+    if value and not _SHA256.fullmatch(value):
+        raise VoiceError(
+            f"Voice manifest field {key!r} is not a SHA-256 hex digest: {value!r}"
+        )
+    return value
+
+
+def _profile_from_entry(entry: Any) -> VoiceProfile:
+    if not isinstance(entry, dict):
+        raise VoiceError(f"Voice manifest entry is not a JSON object: {entry!r}")
+    model = _file_name(entry, "model")
+    return VoiceProfile(
+        id=_required(entry, "id"),
+        name=_required(entry, "name"),
+        language=normalize_language(_required(entry, "language")),
+        gender=_optional(entry, "gender", "unspecified"),
+        model=model,
+        config=_file_name(entry, "config"),
+        model_url=_optional(entry, "model_url"),
+        config_url=_optional(entry, "config_url"),
+        model_sha256=_sha256(entry, "model_sha256"),
+        config_sha256=_sha256(entry, "config_sha256"),
+        quality=_optional(entry, "quality") or quality_from_model_name(model),
+        license=_optional(entry, "license", "unknown"),
+        license_url=_optional(entry, "license_url"),
+        notes=_optional(entry, "notes"),
+    )
+
+
+def _read_json(path: Path) -> Any:
+    """Parse a JSON file in UTF-8 (with or without a BOM), UTF-16 or UTF-32.
+
+    ``json.loads`` on bytes detects the encoding itself; reading as UTF-8 text
+    first would reject a BOM, which Windows editors like to add.
+    """
+    return json.loads(Path(path).read_bytes())
 
 
 def _read_manifest(manifest_path: Path) -> List[VoiceProfile]:
+    """Every profile in one manifest file. Any problem is a :class:`VoiceError`."""
     manifest_path = Path(manifest_path)
     if not manifest_path.exists():
         raise VoiceError(f"Voice manifest not found: {manifest_path}")
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        data = _read_json(manifest_path)
+    except OSError as exc:  # a directory, unreadable, ...
+        raise VoiceError(f"Cannot read voice manifest {manifest_path}: {exc}") from exc
+    except ValueError as exc:  # bad JSON or undecodable bytes
         raise VoiceError(f"Voice manifest {manifest_path} is not valid JSON: {exc}") from exc
-    return [_profile_from_entry(entry) for entry in data.get("voices", [])]
+    voices = data.get("voices", []) if isinstance(data, dict) else None
+    if not isinstance(voices, list):
+        raise VoiceError(
+            f"Voice manifest {manifest_path} must be a JSON object with a "
+            "'voices' list."
+        )
+
+    profiles: List[VoiceProfile] = []
+    seen = set()
+    for entry in voices:
+        profile = _profile_from_entry(entry)
+        if profile.id in seen:
+            # Last-wins would make whichever entry happens to be lower the
+            # real one, silently. Replacing an id is what an overlay is for.
+            raise VoiceError(
+                f"Voice manifest {manifest_path} lists id {profile.id!r} twice."
+            )
+        seen.add(profile.id)
+        profiles.append(profile)
+    return profiles
 
 
 def _discover_profiles(voices_dir: Path, claimed: Iterable[str]) -> List[VoiceProfile]:
@@ -222,6 +362,7 @@ def _discover_profiles(voices_dir: Path, claimed: Iterable[str]) -> List[VoicePr
 
     claimed_names = {name.lower() for name in claimed}
     found: List[VoiceProfile] = []
+    ids = set()
     for model_path in sorted(voices_dir.glob("*.onnx")):
         if model_path.name.lower() in claimed_names:
             continue
@@ -230,30 +371,62 @@ def _discover_profiles(voices_dir: Path, claimed: Iterable[str]) -> List[VoicePr
             # A model without its config cannot be loaded; leaving it out of
             # the listing is friendlier than offering a voice that will fail.
             continue
-        found.append(_profile_from_files(model_path, config_path))
+        if _world_writable(model_path) or _world_writable(config_path):
+            # Anyone on the host could have swapped it, and it would be loaded
+            # into a root process. Downloads are installed 0644.
+            logger.warning(
+                "Ignoring %s: it or its config is world-writable", model_path
+            )
+            continue
+        profile = _profile_from_files(model_path, config_path)
+        if profile.id in ids:
+            # Two files differing only in case map to one id; the first wins
+            # rather than whichever the dict happens to keep.
+            logger.warning(
+                "Ignoring %s: voice id %s is already taken", model_path, profile.id
+            )
+            continue
+        ids.add(profile.id)
+        found.append(profile)
     return found
+
+
+def _world_writable(path: Path) -> bool:
+    """True on POSIX when anyone may write ``path``. Always False on Windows."""
+    if os.name != "posix":
+        return False
+    try:
+        return bool(path.stat().st_mode & stat.S_IWOTH)
+    except OSError:
+        return False
 
 
 def _profile_from_files(model_path: Path, config_path: Path) -> VoiceProfile:
     stem = model_path.name[: -len(".onnx")]
-    language = ""
-    speaker = ""
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        config = _read_json(config_path)
+    except (OSError, ValueError):  # ValueError covers bad JSON and bad bytes
+        config = {}
+    if not isinstance(config, dict):
+        # One stray file (null, a list) must not take down the whole registry;
+        # the file name below still identifies the voice.
         config = {}
 
     language_block = config.get("language")
-    if isinstance(language_block, dict):
-        language = language_block.get("code") or ""
-    if not language:
-        espeak = config.get("espeak")
-        if isinstance(espeak, dict):
-            language = espeak.get("voice") or ""
-    if not language:
-        # Fall back to the file-name convention: <locale>-<speaker>-<quality>.
-        language = stem.split("-")[0]
-    speaker = config.get("dataset") or (
+    espeak = config.get("espeak")
+    code = language_block.get("code") if isinstance(language_block, dict) else None
+    espeak_voice = espeak.get("voice") if isinstance(espeak, dict) else None
+    # The file-name convention: <locale>-<speaker>-<quality>.
+    file_locale = stem.split("-")[0]
+    # The most specific source wins. A config can say just "es" for a voice
+    # whose file name says es_ES, and "es" alone would resolve to es_MX.
+    sources = [code, file_locale, espeak_voice]
+    language = next(
+        (src for src in sources if src and _has_region(src)),
+        next((src for src in (code, espeak_voice, file_locale) if src), ""),
+    )
+    dataset = config.get("dataset")
+    speaker = dataset if isinstance(dataset, str) and dataset else (
         stem.split("-")[1] if "-" in stem else stem
     )
 
@@ -276,7 +449,11 @@ class VoiceRegistry:
     """Loads voice profiles from manifests and disk, and reports install state."""
 
     def __init__(self, profiles: List[VoiceProfile], voices_dir: Path):
-        self._profiles: Dict[str, VoiceProfile] = {p.id: p for p in profiles}
+        self._profiles: Dict[str, VoiceProfile] = {}
+        for profile in profiles:
+            if profile.id in self._profiles:
+                raise VoiceError(f"Voice id {profile.id!r} appears twice.")
+            self._profiles[profile.id] = profile
         self._voices_dir = Path(voices_dir)
 
     @classmethod
@@ -315,7 +492,7 @@ class VoiceRegistry:
         return cls(profiles, voices_dir)
 
     @classmethod
-    def from_settings(cls, settings) -> VoiceRegistry:
+    def from_settings(cls, settings: Settings) -> VoiceRegistry:
         """Build the registry a :class:`~syscon_tts.config.Settings` describes."""
         return cls.from_manifest(
             settings.voices_manifest,
@@ -380,10 +557,13 @@ class VoiceRegistry:
     def default_for_language(self, language: str) -> VoiceProfile:
         """Best voice for a locale, preferring installed ones.
 
-        Among equally close matches the catalogue order decides, so the
-        preferred voice for a language is whichever entry the manifest lists
-        first -- a site that wants a different one puts it at the top of its
-        overlay manifest. Quality deliberately does not decide: a high-quality
+        Among equally close matches the catalogue order decides: the bundled
+        manifest's order, then new overlay entries in theirs. An overlay entry
+        that reuses an id keeps that id's place, so reordering an overlay does
+        not change the choice -- a site that wants a different voice for a
+        language names it in ``SYSCON_TTS_DEFAULT_VOICES``, which
+        :func:`~syscon_tts.alerts.resolve_voice_id` checks before calling
+        this. Quality deliberately does not decide: a high-quality
         model is several times slower on APU-class hardware, and that trade is
         the operator's to make, not this function's.
 
@@ -410,4 +590,19 @@ class VoiceRegistry:
         return self._voices_dir / profile.config
 
     def is_installed(self, profile: VoiceProfile) -> bool:
-        return self.model_path(profile).exists() and self.config_path(profile).exists()
+        """True when both files are non-empty regular files.
+
+        A 0-byte file (an interrupted copy) or a directory of the same name
+        would otherwise count as installed and fail only at synthesis.
+        """
+        return _nonempty_file(self.model_path(profile)) and _nonempty_file(
+            self.config_path(profile)
+        )
+
+
+def _nonempty_file(path: Path) -> bool:
+    try:
+        info = path.stat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0

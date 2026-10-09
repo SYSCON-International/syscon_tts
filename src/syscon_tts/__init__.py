@@ -36,6 +36,7 @@ from .alerts import (
     AlertAudio,
     AlertSynthesizer,
     AlertTextTooLongError,
+    AlertWriteError,
     InvalidAlertNameError,
     alert_file_name,
     ensure_alert_wav,
@@ -55,6 +56,7 @@ from .engine import (
     TTSEngine,
     piper_available,
 )
+from .errors import SysconTTSError
 from .voices import (
     UnknownVoiceError,
     VoiceError,
@@ -64,12 +66,13 @@ from .voices import (
     normalize_language,
 )
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 __all__ = [
     "AlertAudio",
     "AlertSynthesizer",
     "AlertTextTooLongError",
+    "AlertWriteError",
     "DownloadError",
     "IntegrityError",
     "InvalidAlertNameError",
@@ -77,6 +80,7 @@ __all__ = [
     "Settings",
     "SynthesisError",
     "SynthesisUnavailableError",
+    "SysconTTSError",
     "TTSEngine",
     "UnknownVoiceError",
     "VoiceError",

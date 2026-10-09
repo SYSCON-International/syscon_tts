@@ -3,6 +3,9 @@
 import hashlib
 import io
 import json
+import os
+import stat
+import time
 import urllib.error
 
 import pytest
@@ -159,6 +162,16 @@ def test_fetch_writes_the_file_atomically(serve, tmp_path):
     assert list(dest.parent.glob("*.part")) == []
 
 
+@pytest.mark.skipif(os.name != "posix", reason="file modes are POSIX-only")
+def test_fetched_models_are_readable_by_other_users(serve, tmp_path):
+    # mkstemp creates 0600; a model fetched with sudo must still load in the
+    # service account and in an unprivileged `doctor`.
+    serve["payload"] = b"model bytes"
+    dest = tmp_path / "voices" / "m.onnx"
+    _fetch("https://x/m.onnx", dest)
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o644
+
+
 def test_fetch_refuses_bytes_that_do_not_match_the_pin(serve, tmp_path):
     serve["payload"] = b"something else entirely"
     dest = tmp_path / "m.onnx"
@@ -241,3 +254,49 @@ def test_verify_voice_ignores_unpinned_and_missing_files(tmp_path):
     (tmp_path / "v.onnx").write_bytes(b"anything")
     assert verify_voice(unpinned, tmp_path) == []
     assert verify_voice(make_profile(), tmp_path / "empty") == []
+
+
+# -- orphaned partial downloads ----------------------------------------------
+
+
+def _orphan(directory, name, age_seconds, size=10):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_bytes(b"x" * size)
+    stamp = time.time() - age_seconds
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_download_sweeps_partial_files_from_an_interrupted_run(
+    registry, fetched, tmp_path
+):
+    voices = tmp_path / "voices"
+    stale = [
+        _orphan(voices, ".syscon-tts-abc.part", 2 * 3600),
+        _orphan(voices, "tmpold.part", 2 * 3600),  # from 0.0.4 / 0.1.0
+    ]
+    live = _orphan(voices, ".syscon-tts-live.part", 5)  # another run, mid-file
+    model = _orphan(voices, "en_US-kristin-medium.onnx", 2 * 3600)
+    notes = []
+
+    download_voices(registry, voices, language="en-us", on_progress=notes.append)
+
+    assert not any(path.exists() for path in stale)
+    assert live.exists() and model.exists()
+    assert any("removed 2 partial download" in note for note in notes)
+
+
+def test_fetch_uses_the_sweepable_temp_name(serve, tmp_path, monkeypatch):
+    made = []
+    real = download_mod.tempfiles.make_temp
+
+    def spy(directory):
+        fd, path = real(directory)
+        made.append(path.name)
+        return fd, path
+
+    monkeypatch.setattr(download_mod.tempfiles, "make_temp", spy)
+    serve["payload"] = b"model bytes"
+    _fetch("https://x/m.onnx", tmp_path / "voices" / "m.onnx")
+    assert made[0].startswith(".syscon-tts-") and made[0].endswith(".part")

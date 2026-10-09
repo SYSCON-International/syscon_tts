@@ -1,7 +1,7 @@
 name: Release to PyPI
 
 # Publishes when a version tag is pushed:
-#     git tag v0.0.4 && git push origin v0.0.4
+#     git tag v0.0.5 && git push origin v0.0.5
 #
 # A manual run (Actions -> Release to PyPI -> Run workflow) publishes to
 # TestPyPI only, as a rehearsal. PyPI itself is reachable only from a tag, so

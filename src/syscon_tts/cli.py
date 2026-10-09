@@ -32,7 +32,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, tempfiles
 from .alerts import AlertSynthesizer, InvalidAlertNameError, resolve_voice_id
 from .config import load_settings, resolve_data_dir
 from .download import DownloadError, download_voices, verify_voice
@@ -139,6 +139,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 + (f" ({p.license_url})" if p.license_url else "")
                 for p in unreviewed
             )
+        )
+
+    orphans = tempfiles.find_stale(settings.voices_dir)
+    if orphans:
+        # Also not a failure: they waste disk but break nothing. Reported
+        # rather than removed, because doctor usually runs unprivileged.
+        size_mb = sum(size for _, size in orphans) / 1e6
+        print(
+            f"\n{len(orphans)} partial download(s) ({size_mb:.0f} MB) left in "
+            f"{settings.voices_dir} by an interrupted download-voices. Rerun "
+            "'syscon-tts download-voices' as a user that can write there to "
+            "remove them."
         )
 
     for voice_id in [settings.default_voice, *settings.default_voices.values()]:

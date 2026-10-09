@@ -12,22 +12,30 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import tempfile
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from . import tempfiles
+from .errors import SysconTTSError
 from .voices import VoiceProfile, VoiceRegistry, normalize_language
 
-logger = logging.getLogger("syscon_tts")
+logger = logging.getLogger(__name__)
 
 #: Downloads are large (~60 MB per model); allow a generous connect timeout.
 DEFAULT_TIMEOUT = 60
 
+#: Mode for installed model files. ``mkstemp`` creates them 0600 and the rename
+#: keeps that, so a model fetched with ``sudo`` would be unreadable by the
+#: service account and by ``doctor`` run as anyone else. Models are public
+#: downloads; there is nothing to hide.
+MODEL_FILE_MODE = 0o644
 
-class DownloadError(Exception):
+
+class DownloadError(SysconTTSError):
     """A voice asset could not be retrieved."""
 
 
@@ -76,14 +84,13 @@ def _fetch(
     """
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".part")
+        fd, tmp = tempfiles.make_temp(dest.parent)
     except PermissionError as exc:
         raise DownloadError(
             f"Cannot write to {dest.parent}: permission denied. Run as a user "
             "that can write there (e.g. with sudo), or point "
             "SYSCON_TTS_VOICES_DIR somewhere writable."
         ) from exc
-    tmp = Path(tmp_name)
     try:
         # Wrap the descriptor first so it is closed even if urlopen raises --
         # otherwise the leaked handle also blocks the cleanup unlink on Windows.
@@ -93,6 +100,8 @@ def _fetch(
                 for chunk in iter(lambda: response.read(1024 * 1024), b""):
                     digest.update(chunk)
                     handle.write(chunk)
+            if hasattr(os, "fchmod"):  # POSIX; Windows has no mode to fix
+                os.fchmod(handle.fileno(), MODEL_FILE_MODE)
         size = tmp.stat().st_size
         if size == 0:
             raise DownloadError(f"{url} returned an empty response.")
@@ -248,6 +257,14 @@ def download_voices(
                 on_progress(
                     f"  skip {profile.id} (no download URL; supplied on disk)"
                 )
+
+    # An interrupted earlier run (Ctrl-C, a dropped SSH session) leaves its
+    # partial model behind, up to ~60 MB apiece. Rerunning the download is
+    # what the operator does next, and this command has the write access to
+    # clean up -- doctor, run unprivileged, only reports them.
+    removed = tempfiles.sweep_stale(Path(voices_dir))
+    if removed and on_progress:
+        on_progress(f"  removed {removed} partial download(s) from an earlier run")
 
     results: list[DownloadResult] = []
     for profile in profiles:
