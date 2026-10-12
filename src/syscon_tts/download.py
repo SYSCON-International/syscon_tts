@@ -11,6 +11,7 @@ the package runs fully offline.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import logging
 import os
 import urllib.error
@@ -91,6 +92,13 @@ def _fetch(
             "that can write there (e.g. with sudo), or point "
             "SYSCON_TTS_VOICES_DIR somewhere writable."
         ) from exc
+    except OSError as exc:
+        # Disk full, read-only filesystem, a file where the directory should
+        # be: an actionable message, not a traceback out of provisioning.
+        raise DownloadError(
+            f"Cannot prepare {dest.parent} for download: "
+            f"{exc.strerror or exc}."
+        ) from exc
     try:
         # Wrap the descriptor first so it is closed even if urlopen raises --
         # otherwise the leaked handle also blocks the cleanup unlink on Windows.
@@ -122,6 +130,20 @@ def _fetch(
             "access; on an air-gapped APU, download on another machine and "
             "copy the voices directory across."
         ) from exc
+    except DownloadError:
+        # Our own errors (empty response, integrity mismatch) -- already
+        # actionable. Clean up the temp file and let them through.
+        tmp.unlink(missing_ok=True)
+        raise
+    except (OSError, http.client.HTTPException) as exc:
+        # A write that began and then failed: disk filled mid-download, the
+        # connection dropped (socket timeout / IncompleteRead), the rename
+        # could not complete. Operators get a diagnosis, not a stack trace.
+        tmp.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Download of {url} failed: {getattr(exc, 'strerror', None) or exc}. "
+            "Check free disk space and the network connection, then retry."
+        ) from exc
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -146,7 +168,19 @@ def verify_voice(profile: VoiceProfile, voices_dir: Path) -> list[str]:
         path = Path(voices_dir) / file_name
         if not expected or not path.is_file():
             continue
-        actual = file_sha256(path)
+        try:
+            actual = file_sha256(path)
+        except OSError as exc:
+            # Unreadable (a sudo-downloaded 0600 model on a box upgraded from
+            # 0.0.4), or vanished mid-check. doctor must say which file and
+            # why, not die with a PermissionError traceback.
+            problems.append(
+                f"{profile.id}: cannot read {file_name} to verify it "
+                f"({exc.strerror or exc}). Fix its permissions (e.g. "
+                f"'sudo chmod 644 {path}') or re-fetch with "
+                f"'syscon-tts download-voices --force {profile.id}'."
+            )
+            continue
         if actual != expected:
             problems.append(
                 f"{profile.id}: {file_name} does not match its pinned SHA-256 "

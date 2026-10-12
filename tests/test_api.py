@@ -72,6 +72,42 @@ def test_synthesize_text_too_long_returns_413(client):
     assert r.status_code == 413
 
 
+@pytest.mark.parametrize(
+    "payload, status",
+    [
+        ({}, 422),                                   # text is required
+        ({"text": "hi", "format": "ogg"}, 400),      # unsupported format
+        ({"text": "hi", "speed": 0}, 422),           # below the 0.5 floor
+        ({"text": "hi", "speed": 0.4}, 422),         # still below it
+        ({"text": "hi", "speed": 2.01}, 422),        # above the 2.0 ceiling
+        ({"text": "hi", "sentence_silence": 1.01}, 422),  # above the 1 s cap
+    ],
+)
+def test_synthesize_rejects_bad_input(client, monkeypatch, payload, status):
+    # The DoS guard (speed/silence bounds) and the format mapping must be
+    # enforced, not fall through to a 500. For the 400 case, synthesis is
+    # reached with a bad format and must map to 400, so stub the engine.
+    def fake_synth(self, text, voice_id, fmt="wav", speed=1.0, sentence_silence=0.2):
+        from syscon_tts.engine import SynthesisError
+
+        if fmt not in ("wav", "mp3"):
+            raise SynthesisError(f"Unsupported format '{fmt}'.")
+        return b"RIFFdata", "audio/wav"
+
+    monkeypatch.setattr(engine_mod.TTSEngine, "synthesize", fake_synth)
+    r = client.post("/synthesize", json=payload)
+    assert r.status_code == status
+
+
+def test_synthesize_empty_text_is_rejected(client, monkeypatch):
+    # Empty/whitespace text reaches the engine, which raises SynthesisError
+    # -> 400, not a 500.
+    r = client.post("/synthesize", json={"text": "   "})
+    # Either the engine rejects it (400) or, on a host without a model, the
+    # missing-model/engine path answers first -- both are decidable, non-500.
+    assert r.status_code in (400, 501, 503)
+
+
 def test_synthesize_uses_default_voice(client, monkeypatch):
     captured = {}
 

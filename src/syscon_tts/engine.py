@@ -41,6 +41,14 @@ from .voices import VoiceNotInstalledError, VoiceProfile, VoiceRegistry
 
 logger = logging.getLogger(__name__)
 
+#: Bounds on synthesis parameters, as a backstop against a request that asks
+#: for far more audio than any announcement needs. The HTTP layer applies its
+#: own (tighter) limits; these protect the library and CLI paths as well.
+#: Wider than the HTTP bounds so a deliberate CLI render is not over-restricted.
+MIN_SPEED = 0.25
+MAX_SPEED = 4.0
+MAX_SENTENCE_SILENCE = 5.0
+
 
 class SynthesisError(SysconTTSError):
     """Raised when audio synthesis fails."""
@@ -159,7 +167,21 @@ class TTSEngine:
                 )
 
             started = time.monotonic()
-            voice = self._open_voice(PiperVoice, model_path, config_path)
+            try:
+                voice = self._open_voice(PiperVoice, model_path, config_path)
+            except Exception as exc:
+                # A corrupt or partial model (onnxruntime InvalidProtobuf), a
+                # malformed config (JSONDecodeError, KeyError) or a bad
+                # dropped-in voice must surface as our documented error, not a
+                # raw library exception -- callers are told `except
+                # SysconTTSError` is enough.
+                logger.exception("Could not load voice %s", profile.id)
+                raise SynthesisError(
+                    f"Could not load voice '{profile.id}' from {model_path.name}: "
+                    f"{exc}. The model or its config may be corrupt or "
+                    f"incomplete; re-fetch it with 'syscon-tts download-voices "
+                    f"--force {profile.id}'."
+                ) from exc
             logger.info(
                 "Loaded voice %s in %.2fs (threads=%s)",
                 profile.id, time.monotonic() - started, self._threads or "default",
@@ -221,8 +243,20 @@ class TTSEngine:
         """
         if not text or not text.strip():
             raise SynthesisError("Text is empty.")
-        if speed <= 0:
-            raise SynthesisError("Speed must be greater than 0.")
+        # Bounds, not just speed > 0: length_scale is 1/speed, so a near-zero
+        # speed (or a large per-sentence silence) turns a short request into
+        # minutes of audio and gigabytes of RAM while the voice lock is held.
+        # The HTTP layer rejects these too (api.py); this guards every caller,
+        # including the CLI and the library.
+        if not MIN_SPEED <= speed <= MAX_SPEED:
+            raise SynthesisError(
+                f"Speed must be between {MIN_SPEED} and {MAX_SPEED} (got {speed})."
+            )
+        if not 0 <= sentence_silence <= MAX_SENTENCE_SILENCE:
+            raise SynthesisError(
+                f"sentence_silence must be between 0 and {MAX_SENTENCE_SILENCE} "
+                f"seconds (got {sentence_silence})."
+            )
 
         profile = self._registry.get(voice_id)
         voice = self._load_voice(profile)

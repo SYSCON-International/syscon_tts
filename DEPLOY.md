@@ -14,10 +14,44 @@ fallback behind it.
 # Confirm the interpreter is in range first:
 python3 --version            # must be 3.9.x / 3.10.x / 3.11.x
 
-pip install syscon-tts
+# Install into the APU's own virtualenv, PINNED. An unpinned
+# `pip install syscon-tts` floats the version and the native runtime
+# (onnxruntime, piper-phonemize, protobuf, flatbuffers), so two sites
+# provisioned weeks apart run different engines and crash reports stop being
+# reproducible. Pin syscon-tts and lock the native deps with hashes:
+/opt/syscon-tts/.venv/bin/pip install --require-hashes -r requirements-tts.lock
+# where requirements-tts.lock pins syscon-tts==<this release> and its
+# transitive onnxruntime / piper-phonemize / protobuf / flatbuffers to exact
+# versions + sha256 (generate it once per release with `pip-compile
+# --generate-hashes`, and reuse it for the air-gapped wheelhouse in §6).
+
 syscon-tts download-voices --language en-us   # one-time, needs internet
 syscon-tts doctor                             # must report "Ready."
 ```
+
+The host also needs **glibc ≥ 2.28** (RHEL/CentOS 8+, Debian 10+,
+Ubuntu 18.10+) on x86-64 or aarch64 — that is all `piper-phonemize` ships a
+wheel for. On anything older, musl, or 32-bit ARM the engine will not install;
+see pyproject's dependency comment.
+
+> **Point `doctor` at what the APU actually reads.** A bare `syscon-tts doctor`
+> checks the package defaults — `/var/lib/syscon-tts/voices` and the bundled
+> catalogue. The APU embeds the library with its *own* paths and catalogue, so
+> a bare `doctor` can print "Ready." while the PA page reports "not installed."
+> Run the gate with the APU's environment so it checks the real target, and
+> name the languages the site announces in (see C-9, `doctor --language`):
+>
+> ```bash
+> SYSCON_TTS_VOICES_DIR="$BASE_DIR/text_to_speech_voices" \
+> SYSCON_TTS_MANIFEST="<the APU's voice catalogue JSON>" \
+>   syscon-tts doctor --language es-mx
+> ```
+>
+> Confirm `$BASE_DIR` and the catalogue path against the APU's Django settings;
+> they are **not** the package defaults. Also note: a non-root
+> `download-voices` on a fresh box lands models in `~/.local/share`, not
+> `/var/lib` — run provisioning as the account (and with the paths) the APU
+> uses, or `doctor` and the APU will look in different places.
 
 `doctor` is the gate. It exits non-zero and explains the problem if Piper is
 missing on a Linux host, if no models are on disk, if an installed model does
@@ -148,6 +182,17 @@ already exercises a worker crash on every platform via the self-test hook.
 
 ## 2. Replace `call_tts()` in the APU
 
+> ⚠️ **This recipe is stale — do not follow it verbatim for the current APU.**
+> It is written against the handler as it was *before* the Syscon-TTS
+> integration branch (`v2.0.2.8.0-1823-Syscon-TTS`). It references
+> `send_message_to_all_web_socket_client`, `tts_voice_name` and per-client
+> rendering that no longer exist, a 1-argument `call_tts` (the shipped one
+> takes `message, file_name, language_code`), and tells you *not* to pass
+> `file_name` — but the shipped handler does pass an explicitly-built name.
+> See **`SECURITY_HANDOFF_APU_TTS.md` → "C-10: §2 call_tts recipe"** for the
+> reconciliation against the shipped handler and the file-name contract before
+> relying on anything below.
+
 The APU's previous implementation shelled out to the VoiceText binary
 (`PublicAddressWebSocketHandler.call_tts`). Everything downstream — the
 websocket push, `/media/` serving, `check_for_file_delete` — only cares that
@@ -274,9 +319,32 @@ wait for the first rather than rendering N times. A hit requires the file's
 embedded fingerprint (text, voice, speed, sentence silence) to match, so a
 leftover VoiceText WAV is re-rendered, never announced. `check_for_file_delete`
 still unlinks each WAV once no client holds it. The other win from a
-long-lived `AlertSynthesizer` is the **in-memory model cache** — call
-`synthesizer.preload(language=...)` in `message_controller_initialization` to
-pay the model load at startup instead of during the first announcement.
+long-lived `AlertSynthesizer` is the **in-memory model cache** — warm it at
+startup so the multi-second model load is not paid during the first
+announcement.
+
+`preload()` is a multi-second CPU burn (it loads the model), so it must **not**
+run on the Tornado IO loop — doing so stalls every socket that manager serves
+for ~1.5 s per controller start. Fire it off the loop, and swallow failures, so
+an unprovisioned or dev host (no model, no Piper) does not close the PA socket
+on open. Match the APU's own `prepare_text_to_speech`:
+
+```python
+async def message_controller_initialization(self):
+    ...
+    async def _warm():
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _synthesizer().preload, None, self.tts_language
+            )
+        except Exception:
+            logger.warning("TTS preload skipped (no model or no Piper here)")
+    asyncio.ensure_future(_warm())   # fire-and-forget; do not await
+```
+
+(`_synthesizer()` is the module-level cached `AlertSynthesizer` from §2, not a
+bare `synthesizer` name. `preload(voice=None, language=...)` returns the voice
+id it loaded.)
 
 Alert text longer than `max_alert_chars` (default 1,000 characters,
 `SYSCON_TTS_MAX_ALERT_CHARS`) raises `AlertTextTooLongError`, a
@@ -289,6 +357,14 @@ WARNING). The package attaches no handler of its own; give the `syscon_tts`
 logger one in the APU's logging configuration to see them.
 
 ### Choosing the voice
+
+> **Upgrading a Korean or Japanese VoiceText site? Stop.** Piper has **no**
+> Korean or Japanese voice in this catalogue, so those sites would silently
+> announce in English after the upgrade. There is no in-place migration for
+> them. The old VoiceText→Piper voice mapping, the "TTS Voice Overrides"
+> setting and migration 0021 are APU-side concerns — see
+> **`SECURITY_HANDOFF_APU_TTS.md` → "C-13: VoiceText→Piper migration"** for the
+> mapping table and the pre-upgrade check that must gate those locales.
 
 The VoiceText numeric `TTS_VOICE_ID` catalogue is gone. Two options, in order
 of preference:
@@ -527,11 +603,26 @@ trade-off on the actual hardware with `syscon-tts benchmark --threads N`
 
 ### Memory
 
-Each resident `medium` model costs roughly 50–120 MB of RSS. The engine keeps
-up to `SYSCON_TTS_MAX_LOADED_VOICES` (default 3) loaded and evicts
-least-recently-used beyond that. A trilingual site therefore holds ~180 MB —
-and both the HTTP and HTTPS Tornado socket managers load their own copies, so
-size for two processes.
+Each resident `medium` model costs roughly **139 MB** of RSS once it has
+rendered once — the model plus the onnxruntime inference arena, which is
+allocated on the first synthesis, not at load. Budget another ~37 MB per
+process for the Python runtime and onnxruntime itself. These are the
+`syscon-tts benchmark` figures after a warm render; measure on your own
+hardware.
+
+The engine keeps up to `SYSCON_TTS_MAX_LOADED_VOICES` (default 3) loaded and
+evicts least-recently-used beyond that. A trilingual site at the default holds
+~3 × 139 MB + 37 MB ≈ **0.45 GB per process**, and **both** the HTTP and HTTPS
+Tornado socket managers load their own copies — so **~0.9 GB** for the pair.
+That can push an APU into swap or the OOM killer, whose symptom is slow or
+dropped announcements.
+
+**For the APU, set `SYSCON_TTS_MAX_LOADED_VOICES=1` (or 2 for a bilingual
+site) and `SYSCON_TTS_THREADS=2`.** One or two resident voices covers almost
+every site, and capping threads leaves CPU for machine monitoring during a
+render. Earlier guidance here said 50–120 MB per voice and ~180 MB for a
+trilingual site; that under-counted the arena and the second process by about
+three times. Re-size any APU provisioned against the old numbers.
 
 ### Benchmarking (post-deployment)
 

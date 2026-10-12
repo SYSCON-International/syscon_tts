@@ -51,11 +51,17 @@ class SynthesizeRequest(BaseModel):
         ),
     )
     format: str = Field("wav", description="Output format: 'wav' or 'mp3'.")
+    # A tiny speed (1/speed = length_scale) or long per-sentence silence turns
+    # a short request into minutes of audio and gigabytes of RAM while the
+    # voice lock is held -- an unauthenticated OOM. The bounds keep one request
+    # bounded; they match the engine-side guards in synthesize_wav.
     speed: float = Field(
-        1.0, gt=0, le=4.0, description="Speed multiplier (1.0 = normal)."
+        1.0, ge=0.5, le=2.0, allow_inf_nan=False,
+        description="Speed multiplier (0.5-2.0; 1.0 = normal).",
     )
     sentence_silence: float = Field(
-        0.2, ge=0, le=5.0, description="Seconds of silence between sentences."
+        0.2, ge=0, le=1.0, allow_inf_nan=False,
+        description="Seconds of silence between sentences (0-1).",
     )
 
 

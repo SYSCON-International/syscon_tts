@@ -20,6 +20,7 @@ from syscon_tts import alerts as alerts_mod
 from syscon_tts.alerts import (
     AlertSynthesizer,
     AlertTextTooLongError,
+    AlertWriteError,
     InvalidAlertNameError,
     add_fingerprint,
     alert_file_name,
@@ -375,6 +376,33 @@ def test_failed_synthesis_leaves_no_partial_file(tmp_path):
     assert leftovers == []
 
 
+def test_disk_full_during_write_raises_alertwriteerror_and_cleans_up(
+    tmp_path, monkeypatch
+):
+    # The failure that matters in production is ENOSPC during the write/rename,
+    # after the engine has produced audio -- not before it. The previous
+    # write-failure tests fail earlier (in the engine, or at mkdir), so moving
+    # the write outside the AlertWriteError wrap, or dropping the temp-file
+    # cleanup, would pass unnoticed.
+    import errno
+
+    synth = build(tmp_path)  # a working FakeEngine; the write is what fails
+
+    def enospc(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(alerts_mod.os, "replace", enospc)
+
+    with pytest.raises(AlertWriteError) as excinfo:
+        synth.ensure("Press 4 fault")
+    assert excinfo.value.errno == errno.ENOSPC
+    assert isinstance(excinfo.value, OSError)  # documented: also an OSError
+
+    alerts = tmp_path / "alerts"
+    leftovers = list(alerts.glob("*")) if alerts.exists() else []
+    assert leftovers == [], f"a partial file was left behind: {leftovers}"
+
+
 def test_result_is_path_like(tmp_path):
     synth = build(tmp_path)
     result = synth.ensure("Press 4 fault")
@@ -558,9 +586,14 @@ def test_preload_resolves_and_loads(tmp_path):
 
 
 def test_setting_overrides_replace_the_environment(tmp_path, monkeypatch):
-    monkeypatch.delenv("SYSCON_TTS_ALERTS_DIR", raising=False)
-    synth = AlertSynthesizer(alerts_dir=tmp_path / "media" / "public_alert_sounds")
-    assert synth.settings.alerts_dir == tmp_path / "media" / "public_alert_sounds"
+    # The APU passes its paths as keywords. A stray SYSCON_TTS_ALERTS_DIR in
+    # the environment must NOT win over that -- otherwise the alerts directory
+    # could be silently redirected out from under the APU. (The old test
+    # deleted the env var, so it never actually proved the precedence.)
+    wanted = tmp_path / "media" / "public_alert_sounds"
+    monkeypatch.setenv("SYSCON_TTS_ALERTS_DIR", str(tmp_path / "from_env"))
+    synth = AlertSynthesizer(alerts_dir=wanted)
+    assert synth.settings.alerts_dir == wanted
 
 
 def test_settings_object_and_overrides_together_is_an_error(tmp_path):

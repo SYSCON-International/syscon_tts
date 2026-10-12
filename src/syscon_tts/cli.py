@@ -37,7 +37,8 @@ from .alerts import AlertSynthesizer, InvalidAlertNameError, resolve_voice_id
 from .config import load_settings, resolve_data_dir
 from .download import DownloadError, download_voices, verify_voice
 from .engine import SynthesisError, SynthesisUnavailableError, TTSEngine, piper_available
-from .voices import VoiceError, VoiceRegistry
+from .errors import SysconTTSError
+from .voices import UnknownVoiceError, VoiceError, VoiceRegistry, normalize_language
 
 #: ``alert`` could not synthesize because this host cannot run Piper.
 #: sysexits.h's EX_UNAVAILABLE; argparse already owns 2.
@@ -159,6 +160,46 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             problems.append(
                 f"Configured voice '{voice_id}' is not in the catalogue. "
                 "Check SYSCON_TTS_DEFAULT_VOICE / SYSCON_TTS_DEFAULT_VOICES."
+            )
+        elif not registry.is_installed(registry.get(voice_id)):
+            # Catalogued but not on disk. A per-language voice that is missing
+            # silently falls back to the English default, so a Spanish or
+            # Chinese site would go live announcing in English. The gate must
+            # fail here, not print "Ready."
+            problems.append(
+                f"Configured voice '{voice_id}' is not installed. Run "
+                f"'syscon-tts download-voices {voice_id}'. Until then the site "
+                "falls back to the default voice -- likely announcing in the "
+                "wrong language."
+            )
+
+    # Each --language a site actually announces in must resolve to an INSTALLED
+    # voice, not merely a catalogued one. This mirrors the runtime resolution
+    # (resolve_voice_id): a configured per-language default wins over the
+    # catalogue, so a site on the interim es-MX voice is checked against that
+    # voice, not the catalogue's native one.
+    for language in getattr(args, "language", None) or []:
+        wanted = normalize_language(language)
+        intended = settings.default_voices.get(wanted)
+        if not intended:
+            try:
+                intended = registry.default_for_language(wanted).id
+            except UnknownVoiceError:
+                problems.append(
+                    f"No voice in the catalogue for --language '{language}'; it "
+                    "would announce in the default voice."
+                )
+                continue
+        if not registry.has(intended):
+            problems.append(
+                f"Language '{language}' is configured to use voice '{intended}', "
+                "which is not in the catalogue (check SYSCON_TTS_DEFAULT_VOICES)."
+            )
+        elif not registry.is_installed(registry.get(intended)):
+            problems.append(
+                f"Language '{language}' resolves to voice '{intended}', which is "
+                f"not installed. Run 'syscon-tts download-voices {intended}' -- "
+                "otherwise this locale announces in the fallback voice."
             )
     if not has_piper:
         if platform.system() == "Linux":
@@ -305,7 +346,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     from . import benchmark
 
-    settings, registry, engine = _build_registry_and_engine(threads=args.threads)
+    settings = load_settings(threads=args.threads)
+    registry = VoiceRegistry.from_settings(settings)
     requested = args.voices or [p.id for p in registry.installed()]
     if not requested:
         print(
@@ -314,6 +356,15 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Keep every benchmarked voice resident. With the default cache of 3, a
+    # fourth voice evicts the first, so its measured memory growth reads near
+    # zero and sites size the APU for a fraction of the real footprint. The
+    # whole point of this command is the per-voice cost, so nothing may evict.
+    engine = TTSEngine(
+        registry, max_loaded_voices=max(len(requested), settings.max_loaded_voices),
+        threads=settings.threads,
+    )
 
     results = []
     try:
@@ -355,6 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--quick", action="store_true",
                           help="Skip checking installed models against their "
                                "pinned SHA-256.")
+    p_doctor.add_argument("-l", "--language", action="append", metavar="CODE",
+                          help="Also require an installed voice for this locale "
+                               "(e.g. es-mx). Repeatable. A site that announces "
+                               "in Spanish should pass --language es-mx so the "
+                               "gate fails if only English is provisioned.")
     p_doctor.set_defaults(func=_cmd_doctor)
 
     p_list = sub.add_parser("list-voices", help="List available voice profiles.")
@@ -440,7 +496,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     try:
         return args.func(args)
-    except VoiceError as exc:
+    except (SysconTTSError, ValueError) as exc:
+        # SysconTTSError covers every error this package raises on purpose
+        # (VoiceError among them); ValueError covers a bad SYSCON_TTS_* value
+        # caught during settings load. Either way the operator gets one clear
+        # line, not a traceback.
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

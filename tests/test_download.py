@@ -202,6 +202,44 @@ def test_fetch_rejects_an_empty_response(serve, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_fetch_wraps_a_mid_download_timeout(serve, tmp_path):
+    # A socket timeout is an OSError, not a URLError; before the fix it escaped
+    # raw and ended provisioning in a traceback.
+    serve["error"] = TimeoutError("timed out")
+    with pytest.raises(DownloadError, match="failed"):
+        _fetch("https://x/m.onnx", tmp_path / "m.onnx")
+    assert list(tmp_path.iterdir()) == []  # no .part left behind
+
+
+def test_fetch_wraps_an_incomplete_read(serve, tmp_path):
+    # IncompleteRead is an http.client.HTTPException, not an OSError, so it
+    # needs its own arm of the handler.
+    import http.client
+
+    serve["error"] = http.client.IncompleteRead(b"partial")
+    with pytest.raises(DownloadError):
+        _fetch("https://x/m.onnx", tmp_path / "m.onnx")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_verify_voice_reports_an_unreadable_model_instead_of_crashing(
+    tmp_path, monkeypatch
+):
+    # Every site upgraded from 0.0.4 has sudo-downloaded 0600 models; doctor
+    # must say which file is unreadable, not die with a PermissionError.
+    profile = make_profile()
+    (tmp_path / "v.onnx").write_bytes(b"model")
+    (tmp_path / "v.onnx.json").write_bytes(b"{}")
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(download_mod, "file_sha256", denied)
+    problems = verify_voice(profile, tmp_path)
+    assert problems
+    assert all("cannot read" in p for p in problems)
+
+
 def make_profile(model=b"model", config=b"{}"):
     return VoiceProfile(
         id="v", name="v", language="en_US", gender="unspecified",

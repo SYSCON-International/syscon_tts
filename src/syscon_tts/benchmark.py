@@ -14,9 +14,13 @@ For each installed voice it measures:
 * RTF       - real-time factor = synth_time / audio_seconds (lower is better;
               < 1.0 means faster than real-time)
 * latency   - wall-clock synthesis time per sample (warm)
-* mem       - resident memory growth from loading that voice
+* mem       - resident memory growth from loading the model AND rendering once,
+              so the onnxruntime arena (allocated on first synthesis) is counted
 
 By default every installed voice is benchmarked against three sample lengths.
+Every benchmarked voice is kept resident (the CLI sizes the cache to the number
+of voices under test), so a later voice's memory is not understated by evicting
+an earlier one.
 """
 
 from __future__ import annotations
@@ -72,7 +76,6 @@ def benchmark_voice(engine: TTSEngine, voice_id: str, runs: int) -> dict:
     t0 = time.perf_counter()
     engine.preload(voice_id)  # cold model load
     load_s = time.perf_counter() - t0
-    rss_after = rss_kb()
 
     samples = {}
     for name, text in SAMPLES.items():
@@ -89,6 +92,13 @@ def benchmark_voice(engine: TTSEngine, voice_id: str, runs: int) -> dict:
             "audio_s": round(audio_s, 3),
             "rtf": round(best / audio_s, 3) if audio_s else None,
         }
+
+    # Sample RSS AFTER a warm render, not right after the model load: onnxruntime
+    # allocates its inference arena on the first synthesis, so measuring before
+    # any render understates the per-voice cost by tens of MB. The caller keeps
+    # every benchmarked voice resident, so this delta is this voice's true
+    # footprint and is not reclaimed by an eviction.
+    rss_after = rss_kb()
 
     return {
         "voice": voice_id,

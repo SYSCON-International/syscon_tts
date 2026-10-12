@@ -112,6 +112,19 @@ def test_doctor_rejects_a_model_that_does_not_match_its_pin(env, capsys):
     assert "download-voices --force en_us_kristin" in err
 
 
+def test_doctor_language_flags_a_missing_locale_voice(env, capsys):
+    # The default (English) voice is installed, so a bare doctor could say
+    # "Ready." -- but the site announces in Spanish, whose voice was never
+    # downloaded. --language must fail the gate instead of letting it go live
+    # in English.
+    install_fake_voice(env, "en_us_kristin")
+    rc = main(["doctor", "--quick", "--language", "es-mx"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "es-mx" in err
+    assert "not installed" in err
+
+
 def test_doctor_quick_skips_hashing(env, capsys):
     install_fake_voice(env)
     rc = main(["doctor", "--quick"])

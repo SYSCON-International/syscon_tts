@@ -35,7 +35,15 @@ class FakePiperVoice:
         self.config = config
         self.session = session
 
+    #: Kwargs of the most recent synthesize() call, so tests can check the
+    #: speed -> length_scale mapping instead of trusting it blindly.
+    last_kwargs = None
+
     def synthesize(self, text, wav_file, length_scale=1.0, sentence_silence=0.2):
+        FakePiperVoice.last_kwargs = {
+            "length_scale": length_scale,
+            "sentence_silence": sentence_silence,
+        }
         with FakePiperVoice._counter_lock:
             FakePiperVoice._in_flight += 1
             FakePiperVoice.peak_concurrency = max(
@@ -172,6 +180,61 @@ def test_synthesis_on_one_voice_is_serialized(fake_piper, registry):
     assert errors == []
     assert fake_piper.peak_concurrency == 1
     assert fake_piper.loads == 1, "concurrent first calls loaded the model twice"
+
+
+def test_speed_maps_to_inverse_length_scale(fake_piper, registry):
+    # length_scale is 1/speed; inverting it (so speed=2 plays at half speed)
+    # would pass every other test but ship announcements at the wrong pace.
+    engine = TTSEngine(registry)
+    engine.synthesize_wav("hello", "v1", speed=2.0)
+    assert fake_piper.last_kwargs["length_scale"] == 0.5
+    engine.synthesize_wav("hello", "v1", speed=0.5)
+    assert fake_piper.last_kwargs["length_scale"] == 2.0
+
+
+@pytest.mark.parametrize("speed", [0.0, 0.1, 5.0, -1.0])
+def test_out_of_range_speed_is_refused(fake_piper, registry, speed):
+    from syscon_tts.engine import SynthesisError
+
+    with pytest.raises(SynthesisError, match="Speed"):
+        TTSEngine(registry).synthesize_wav("hello", "v1", speed=speed)
+
+
+def test_excessive_sentence_silence_is_refused(fake_piper, registry):
+    from syscon_tts.engine import SynthesisError
+
+    with pytest.raises(SynthesisError, match="sentence_silence"):
+        TTSEngine(registry).synthesize_wav("hi", "v1", sentence_silence=99.0)
+
+
+def test_a_corrupt_model_load_becomes_synthesis_error(fake_piper, registry):
+    # onnxruntime raises InvalidProtobuf / the config parse raises on a partial
+    # or corrupt file. Callers are told `except SysconTTSError` is enough, so
+    # that must hold here instead of a raw library exception escaping.
+    from syscon_tts.engine import SynthesisError
+
+    engine = TTSEngine(registry)
+
+    def boom(*a, **k):
+        raise ValueError("invalid protobuf")
+
+    engine._open_voice = boom
+    with pytest.raises(SynthesisError, match="Could not load voice"):
+        engine.synthesize_wav("hello", "v1")
+
+
+def test_a_runtime_synthesis_failure_becomes_synthesis_error(fake_piper, registry):
+    from syscon_tts.engine import SynthesisError
+
+    engine = TTSEngine(registry)
+    engine.preload("v1")
+
+    def boom(*a, **k):
+        raise RuntimeError("espeak blew up")
+
+    engine._cached("v1").synthesize = boom
+    with pytest.raises(SynthesisError, match="Synthesis failed"):
+        engine.synthesize_wav("hello", "v1")
 
 
 def test_output_is_a_wav_container(fake_piper, registry):

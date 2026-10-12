@@ -31,9 +31,19 @@ syscon-tts download-voices en_us_kristin   # one voice is enough for a smoke tes
 syscon-tts speak -v en_us_kristin -o /tmp/hi.wav "Hello"
 ```
 
-On Windows or macOS, generate WAVs on a Linux host, drop them in your
-`SYSCON_TTS_ALERTS_DIR`, and the cache-hit path exercises the full alert
-pipeline locally.
+On Windows or macOS (no Piper), exercise the full alert pipeline against audio
+rendered on a Linux host. Generate it there with `syscon-tts alert` (not
+`speak`, and not a hand-made WAV): `alert` embeds the request fingerprint that
+the cache match checks, so the file replays as a cache hit. A plain WAV without
+that fingerprint is treated as a stale collision and re-rendered, which fails
+with `SynthesisUnavailableError` (exit 69) off Linux.
+
+```bash
+# On a Linux host, into a scratch alerts dir:
+SYSCON_TTS_ALERTS_DIR=./alerts syscon-tts alert "Machine four fault"
+# Copy that alerts dir to the Windows/macOS box, point SYSCON_TTS_ALERTS_DIR at
+# it, and the same `alert` text now resolves as a cache hit with no Piper.
+```
 
 ## Running tests
 

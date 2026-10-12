@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syscon-tts"
-version = "0.0.5"
+# Single-sourced from src/syscon_tts/_version.py; see [tool.setuptools.dynamic]
+# below. Do not add a static version here -- that reintroduces the two-places
+# drift that shipped 0.1.0 reporting 0.0.4.
+dynamic = ["version"]
 description = "Offline neural text-to-speech for the PlantStar APU"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,14 +34,16 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 
-# Piper is installed on Linux only. piper-phonemize 1.1.0 publishes Linux
-# wheels for Python 3.9-3.11 and macOS x86_64 wheels (no Apple Silicon, no
-# Windows), and nothing for Linux on Python 3.12+. Linux is the only target we
-# test synthesis on, so the marker limits it to there. It keeps
-# `pip install syscon-tts` working everywhere: Linux hosts get a synthesis
-# engine, other platforms get a package that can still resolve, inspect, and
-# replay previously generated audio. Run `syscon-tts doctor` after installing
-# to confirm which mode you landed in.
+# Piper is installed on Linux only. piper-phonemize 1.1.0 publishes
+# manylinux_2_28 wheels for x86_64 and aarch64 (Python 3.9-3.11) and no sdist,
+# so the marker also pins the architecture: without it, pip on 32-bit ARM,
+# musl (Alpine), or glibc < 2.28 tries to build from an sdist that does not
+# exist and `pip install syscon-tts` fails outright -- breaking the
+# "install never fails off the engine's platform" contract. The host also
+# needs glibc >= 2.28 (RHEL/CentOS 8+, Debian 10+, Ubuntu 18.10+); older
+# distros cannot load the wheel. On every other platform the package still
+# resolves, inspects, and replays previously generated audio. Run
+# `syscon-tts doctor` after installing to confirm which mode you landed in.
 #
 # LICENCE: do not bump piper-tts past 1.2.x without legal review.
 #   * piper-tts 1.2.0 is MIT, but its piper-phonemize dependency bundles
@@ -48,7 +53,7 @@ classifiers = [
 # question, not a routine upgrade. tests/test_config.py fails if the pin
 # moves. See README, "Engine licensing".
 dependencies = [
-    "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12'",
+    "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12' and platform_machine in 'x86_64 aarch64'",
 ]
 
 [project.optional-dependencies]
@@ -73,6 +78,11 @@ Issues = "https://github.com/SYSCON-International/syscon_tts/issues"
 
 [project.scripts]
 syscon-tts = "syscon_tts.cli:main"
+
+[tool.setuptools.dynamic]
+# The version is read from the module literal at build time, so the wheel's
+# metadata and `syscon_tts.__version__` are always the same number.
+version = { attr = "syscon_tts._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

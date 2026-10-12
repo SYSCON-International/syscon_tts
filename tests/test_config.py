@@ -253,37 +253,38 @@ def test_falls_back_to_xdg_when_system_dir_is_unavailable(linux, monkeypatch):
 # -- platform gating -------------------------------------------------------
 
 
-def test_declared_version_matches_pyproject():
-    """__init__.__version__ and pyproject's version must agree.
+def test_version_is_single_sourced_from_version_module():
+    """The version lives in exactly one place: ``syscon_tts._version``.
 
-    They are declared in two places, and only pyproject drives the published
-    distribution -- so a drift ships a package whose `--version` disagrees with
-    what PyPI says, and the release workflow's tag check would not catch it.
+    pyproject.toml must read it dynamically rather than carry its own literal,
+    so the wheel's metadata and ``syscon_tts.__version__`` can never drift (the
+    way 0.1.0 shipped reporting 0.0.4). This test fails if someone reintroduces
+    a static ``version =`` in ``[project]``.
     """
+    from syscon_tts import _version
+
+    assert syscon_tts.__version__ == _version.__version__
+
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
     if not pyproject.is_file():  # installed without the source tree
         pytest.skip("pyproject.toml not available")
+    text = pyproject.read_text(encoding="utf-8")
 
-    # tomllib is 3.11+; fall back to a narrow regex on older interpreters
-    # rather than taking a dependency just for this check.
     try:
         import tomllib
 
-        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        declared = declared["project"]["version"]
-    except ImportError:
-        match = re.search(
-            r'^version\s*=\s*"([^"]+)"',
-            pyproject.read_text(encoding="utf-8"),
-            re.MULTILINE,
+        parsed = tomllib.loads(text)
+        project = parsed["project"]
+        assert "version" not in project, (
+            "pyproject [project] has a static version; it must be dynamic and "
+            "read from syscon_tts._version so there is one source of truth"
         )
-        assert match, "could not find version in pyproject.toml"
-        declared = match.group(1)
-
-    assert syscon_tts.__version__ == declared, (
-        f"__init__.py says {syscon_tts.__version__} but pyproject.toml says "
-        f"{declared}; bump both together"
-    )
+        assert "version" in project.get("dynamic", [])
+        attr = parsed["tool"]["setuptools"]["dynamic"]["version"]["attr"]
+        assert attr == "syscon_tts._version.__version__", attr
+    except ImportError:  # pragma: no cover - Python < 3.11 lacks tomllib
+        assert re.search(r'^dynamic\s*=\s*\[\s*"version"\s*\]', text, re.MULTILINE)
+        assert 'attr = "syscon_tts._version.__version__"' in text
 
 
 def test_piper_engine_stays_pinned_to_1_2_0():

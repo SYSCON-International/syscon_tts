@@ -32,6 +32,7 @@ Multilingual sites select a voice by locale rather than by id::
     synth.ensure(message, language="es-mx")
 """
 
+from ._version import __version__
 from .alerts import (
     AlertAudio,
     AlertSynthesizer,
@@ -67,7 +68,8 @@ from .voices import (
 )
 from .worker import WorkerEngine
 
-__version__ = "0.0.5"
+# __version__ comes from ._version (imported above), which pyproject.toml also
+# reads -- one source, no drift. See src/syscon_tts/_version.py.
 
 __all__ = [
     "AlertAudio",
