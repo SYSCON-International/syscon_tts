@@ -216,6 +216,18 @@ class VoiceProfile:
     license: str = "unknown"
     license_url: str = ""
     notes: str = ""
+    # Model provenance, when it matters to licensing. ``license`` records the
+    # *dataset* terms, but a Piper voice is often fine-tuned from another
+    # checkpoint, and that base can carry its own restriction a permissive
+    # dataset license does not clear (e.g. a voice fine-tuned from the
+    # research-only en_US-lessac). Recorded here so a reviewer can see why a
+    # voice is flagged.
+    lineage: str = ""
+    # Override for :attr:`requires_license_review`. ``None`` means "decide from
+    # the dataset license" (the default). ``True`` forces review even though
+    # the dataset license is permissive -- the lever for a lineage concern like
+    # the one above. ``False`` records that a reviewer has cleared it.
+    license_review_required: Optional[bool] = None
     # "manifest" for catalogued voices, "disk" for ones found in the voices
     # directory. Discovered voices have no download URL -- whoever put the file
     # there is responsible for it surviving a rebuild.
@@ -223,7 +235,15 @@ class VoiceProfile:
 
     @property
     def requires_license_review(self) -> bool:
-        """True when this voice must not ship to a customer unreviewed."""
+        """True when this voice must not ship to a customer unreviewed.
+
+        An explicit ``license_review_required`` in the manifest wins, so a
+        voice whose *dataset* is permissive but whose model lineage is not can
+        still be held back (and, once cleared, released by flipping that one
+        field). Absent the override, the dataset license decides.
+        """
+        if self.license_review_required is not None:
+            return self.license_review_required
         return license_key(self.license) not in PERMISSIVE_LICENSES
 
     def to_public_dict(self, installed: bool) -> dict:
@@ -281,6 +301,18 @@ def _file_name(entry: dict, key: str) -> str:
     return name
 
 
+def _optional_bool(entry: dict, key: str) -> Optional[bool]:
+    """A tri-state flag: JSON ``true``/``false``, or ``null``/absent for "unset"."""
+    value = entry.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise VoiceError(
+            f"Voice manifest field {key!r} must be true or false: {entry!r}"
+        )
+    return value
+
+
 def _sha256(entry: dict, key: str) -> str:
     value = _optional(entry, key).strip().lower()
     if value and not _SHA256.fullmatch(value):
@@ -309,6 +341,8 @@ def _profile_from_entry(entry: Any) -> VoiceProfile:
         license=_optional(entry, "license", "unknown"),
         license_url=_optional(entry, "license_url"),
         notes=_optional(entry, "notes"),
+        lineage=_optional(entry, "lineage"),
+        license_review_required=_optional_bool(entry, "license_review_required"),
     )
 
 

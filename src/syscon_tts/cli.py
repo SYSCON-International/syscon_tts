@@ -137,6 +137,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             + "\n".join(
                 f"  - {p.id}: {p.license}"
                 + (f" ({p.license_url})" if p.license_url else "")
+                + (f"\n      lineage: {p.lineage}" if p.lineage else "")
                 for p in unreviewed
             )
         )

@@ -1,7 +1,8 @@
 {
   "_comment": "Curated voice catalogue. Each entry maps a stable 'id' to a Piper voice model. Ids are a durable contract - the APU stores the selected id in its settings table - so never rename one after release; add a new entry instead. To add a voice: copy an entry, set a unique id, fill model/config/model_url/config_url from https://huggingface.co/rhasspy/piper-voices, then run `syscon-tts download-voices <id>`. A site that does not want to edit this file can point SYSCON_TTS_EXTRA_MANIFEST at its own JSON (same shape) to add or replace entries, or simply drop the .onnx and .onnx.json into the voices directory, where they are discovered automatically.",
   "_integrity": "Download URLs are pinned to one commit of rhasspy/piper-voices rather than 'main', so an upstream re-upload cannot change how a voice id sounds on newly provisioned sites. model_sha256/config_sha256 are verified after every download and by `syscon-tts doctor`; a mismatch is refused. To move to a newer upload, change the commit in both URLs and update both hashes in the same release.",
-  "_licensing": "PlantStar ships to paying customers, so this catalogue only includes voices whose model card states a license permitting commercial use (public domain, CC0, Unlicense, CC BY). 'license' records what the upstream MODEL_CARD says; anything else is reported by `syscon-tts doctor` as needing review and is skipped by a bulk `download-voices`. Voices deliberately NOT catalogued: en_US-ryan, en_US-hfc_female, en_US-hfc_male and zh_CN-xiao_ya (CC BY-NC-SA, non-commercial); en_US-amy, en_GB-alan and en_US-lessac (license stated only as 'see dataset URL', unverified); zh_CN-chaowen (CC0 dataset but finetuned from the non-commercial xiao_ya). Any of them can still be used by a site that has cleared it - see DEPLOY.md.",
+  "_licensing": "PlantStar ships to paying customers, so this catalogue only includes voices whose model card states a license permitting commercial use (public domain, CC0, Unlicense, CC BY). 'license' records the DATASET license from the upstream MODEL_CARD; a voice is reported by `syscon-tts doctor` as needing review (and skipped by a bulk `download-voices`) when that license is non-permissive OR when 'license_review_required' is set true. The override exists because a Piper voice is often fine-tuned from another checkpoint, and that base can carry a restriction a permissive dataset license does not clear; 'lineage' records the provenance. Voices deliberately NOT catalogued: en_US-ryan, en_US-hfc_female, en_US-hfc_male and zh_CN-xiao_ya (CC BY-NC-SA, non-commercial); en_US-amy, en_GB-alan and en_US-lessac (license stated only as 'see dataset URL', unverified); zh_CN-chaowen (CC0 dataset but finetuned from the non-commercial xiao_ya). Any of them can still be used by a site that has cleared it - see DEPLOY.md.",
+  "_review_es_mx": "NOTE FOR FUTURE REVIEWERS -- Mexican Spanish voice selection. Both Piper es_MX voices trace to research-only en_US-lessac (es_mx_ald -> davefx -> lessac; the other, es_MX-claude, has an undocumented base and a non-commercial sibling, so it is not catalogued). Until legal clears the lessac lineage, es_mx_ald is held (license_review_required: true) and the CLEARED es_es_carlfm (Castilian, trained from scratch, public domain) stands in for Mexican Spanish. Deployments set this via SYSCON_TTS_DEFAULT_VOICES=es_MX=es_es_carlfm (or default_voices={'es_MX': 'es_es_carlfm'} in code). TO SWITCH BACK ONCE legal signs off on es_mx_ald: (1) set 'license_review_required' to false on the es_mx_ald entry here (that alone makes doctor and bulk download-voices treat it as cleared again); (2) change the es_MX default mapping from es_es_carlfm to es_mx_ald. That is the whole switch; nothing else references the interim choice. The genuinely clean long-term option is to RETRAIN on the Ald Mexican dataset (already public domain) from a clean base such as es_es_carlfm or from scratch, which keeps the Mexican accent without the lessac lineage.",
   "_quality": "x_low (smallest/fastest) < low < medium (balanced; the APU default) < high (largest/slowest). Medium models are roughly 60 MB on disk and in RSS.",
   "voices": [
     {
@@ -47,7 +48,10 @@
       "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_MX/ald/medium/es_MX-ald-medium.onnx",
       "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_MX/ald/medium/es_MX-ald-medium.onnx.json",
       "model_sha256": "019b3803293c93e34a206dd2e53a3889209a514e786fd7144f7b70196c579b63",
-      "config_sha256": "5a71498158e04afc8099bfd019c7e87c68eb9d042505a2b1a87e5c1ac2b1a61d"
+      "config_sha256": "5a71498158e04afc8099bfd019c7e87c68eb9d042505a2b1a87e5c1ac2b1a61d",
+      "lineage": "Fine-tuned from es_ES-davefx, which is fine-tuned from en_US-lessac. Lessac's Blizzard 2013 data is research-only and excludes commercial voice-synthesis products, so this model's lineage may not clear for a product we sell, even though the Ald dataset itself is public domain.",
+      "license_review_required": true,
+      "notes": "HELD FOR LICENSE REVIEW (model lineage, not the dataset). The native Mexican voice; use once legal clears the lessac lineage. Interim cleared substitute for es_MX is es_es_carlfm. See _review_es_mx and DEPLOY.md 'Choosing the voice'."
     },
     {
       "id": "es_es_davefx",
@@ -62,7 +66,27 @@
       "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
       "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json",
       "model_sha256": "6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917",
-      "config_sha256": "0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842"
+      "config_sha256": "0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842",
+      "lineage": "Fine-tuned from en_US-lessac (Blizzard 2013, research-only, excludes commercial voice-synthesis products), per the model card at the pinned commit. The CC0 dataset does not clear the model lineage.",
+      "license_review_required": true,
+      "notes": "HELD FOR LICENSE REVIEW (model lineage, not the dataset). Shares the lessac lineage flagged on es_mx_ald. es_es_carlfm is the cleared Castilian alternative."
+    },
+    {
+      "id": "es_es_carlfm",
+      "name": "CarlFM - Spanish (Spain), male",
+      "language": "es_ES",
+      "gender": "male",
+      "quality": "x_low",
+      "license": "Public domain",
+      "license_url": "https://github.com/carlfm01/my-speech-datasets",
+      "model": "es_ES-carlfm-x_low.onnx",
+      "config": "es_ES-carlfm-x_low.onnx.json",
+      "model_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/carlfm/x_low/es_ES-carlfm-x_low.onnx",
+      "config_url": "https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/es/es_ES/carlfm/x_low/es_ES-carlfm-x_low.onnx.json",
+      "model_sha256": "d69677323a907cd4963f42b29c20a98b5d6bfa7f3e64df339915e4650c00d125",
+      "config_sha256": "d9bdfa9ff01eb2bc9e62e7d2593939d1e4c4d8eb7cf75f972731539d12399966",
+      "lineage": "Trained from scratch (no en_US-lessac lineage), per the model card. Dataset is public domain.",
+      "notes": "Cleared for commercial use: clean lineage and a public-domain dataset. Castilian (Spain) accent and x_low quality (16 kHz), so it is the INTERIM substitute for Mexican Spanish while es_mx_ald is under license review -- intelligible, not native. Map it in with SYSCON_TTS_DEFAULT_VOICES=es_MX=es_es_carlfm. See _review_es_mx."
     },
     {
       "id": "zh_cn_huayan",

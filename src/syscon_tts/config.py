@@ -214,6 +214,16 @@ class Settings:
     threads: Optional[int] = None
     file_mode: int = DEFAULT_FILE_MODE
     dir_mode: int = DEFAULT_DIR_MODE
+    # Run Piper synthesis in a separate worker process so an espeak-ng crash
+    # (the pinned engine can segfault on crafted text) surfaces as
+    # SynthesisError instead of taking down the embedding process -- on the
+    # APU, the root Tornado socket manager. Only engages where synthesis can
+    # actually run; see syscon_tts.worker.
+    worker_isolation: bool = True
+    # Account the synthesis worker drops to, when it is started as root (the
+    # APU case). It only needs to read the voices directory. None keeps the
+    # worker as whatever user started it.
+    worker_user: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Validating here rather than in load_settings also covers callers who
@@ -240,6 +250,8 @@ class Settings:
             "threads": self.threads,
             "file_mode": f"{self.file_mode:04o}",
             "dir_mode": f"{self.dir_mode:04o}",
+            "worker_isolation": self.worker_isolation,
+            "worker_user": self.worker_user,
         }
 
 
@@ -250,7 +262,8 @@ _INT_FIELDS = frozenset(
     {"port", "max_text_chars", "max_alert_chars", "max_loaded_voices", "threads"}
 )
 _MODE_FIELDS = frozenset({"file_mode", "dir_mode"})
-_OPTIONAL_FIELDS = frozenset({"extra_manifest", "threads"})
+_BOOL_FIELDS = frozenset({"worker_isolation"})
+_OPTIONAL_FIELDS = frozenset({"extra_manifest", "threads", "worker_user"})
 
 #: The environment variable behind each setting.
 ENV_NAMES = {
@@ -268,7 +281,21 @@ ENV_NAMES = {
     "threads": "SYSCON_TTS_THREADS",
     "file_mode": "SYSCON_TTS_FILE_MODE",
     "dir_mode": "SYSCON_TTS_DIR_MODE",
+    "worker_isolation": "SYSCON_TTS_WORKER_ISOLATION",
+    "worker_user": "SYSCON_TTS_WORKER_USER",
 }
+
+#: Strings that mean "off" for a boolean setting; everything else is true.
+_FALSEY = frozenset({"0", "false", "no", "off", ""})
+
+
+def parse_bool(value: Any, name: str = "flag") -> bool:
+    """Read a boolean setting written the way an env var carries one."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    return str(value).strip().lower() not in _FALSEY
 
 
 def _coerce(name: str, value: Any) -> Any:
@@ -285,6 +312,8 @@ def _coerce(name: str, value: Any) -> Any:
         return {normalize_language(k): str(v) for k, v in dict(value).items()}
     if name in _MODE_FIELDS:
         return parse_mode(value, name)
+    if name in _BOOL_FIELDS:
+        return parse_bool(value, name)
     if name in _INT_FIELDS:
         if isinstance(value, bool):
             raise ValueError(f"{name}={value!r} is not an integer.")

@@ -55,9 +55,34 @@ from typing import Any, Optional
 
 from . import tempfiles
 from .config import Settings, load_settings
-from .engine import SynthesisError, TTSEngine
+from .engine import SynthesisError, TTSEngine, piper_available
 from .errors import SysconTTSError
 from .voices import UnknownVoiceError, VoiceRegistry, normalize_language
+
+
+def _build_engine(settings: Settings, registry: VoiceRegistry):
+    """The synthesis engine an :class:`AlertSynthesizer` uses by default.
+
+    Isolates synthesis in a worker process when it is both wanted
+    (``worker_isolation``) and meaningful (Piper can actually run here, so
+    there is a native crash to contain). Elsewhere -- Windows and macOS
+    developer machines, where synthesis is unavailable anyway -- the in-process
+    engine is used, so nothing is spawned for a path that only ever raises
+    ``SynthesisUnavailableError``.
+
+    The worker rebuilds its registry from ``settings`` (a live
+    ``VoiceRegistry`` cannot cross the process boundary), so a caller that
+    passes a *custom* ``registry`` and wants it honoured during synthesis
+    should pass its own ``engine`` too. The default registry is itself built
+    from ``settings``, so the common path stays consistent.
+    """
+    if settings.worker_isolation and piper_available():
+        from .worker import WorkerEngine
+
+        return WorkerEngine(settings)
+    return TTSEngine(
+        registry, settings.max_loaded_voices, threads=settings.threads
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -324,11 +349,7 @@ class AlertSynthesizer:
             )
         self.settings = settings or load_settings(**setting_overrides)
         self.registry = registry or VoiceRegistry.from_settings(self.settings)
-        self.engine = engine or TTSEngine(
-            self.registry,
-            self.settings.max_loaded_voices,
-            threads=self.settings.threads,
-        )
+        self.engine = engine or _build_engine(self.settings, self.registry)
         # Concurrent ensure() calls for one file wait for each other, so the
         # second finds the first's WAV instead of rendering it again -- the
         # APU calls ensure() once per connected client for the same message.

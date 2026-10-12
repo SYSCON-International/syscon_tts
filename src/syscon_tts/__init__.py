@@ -65,6 +65,7 @@ from .voices import (
     VoiceRegistry,
     normalize_language,
 )
+from .worker import WorkerEngine
 
 __version__ = "0.0.5"
 
@@ -87,6 +88,7 @@ __all__ = [
     "VoiceNotInstalledError",
     "VoiceProfile",
     "VoiceRegistry",
+    "WorkerEngine",
     "__version__",
     "alert_file_name",
     "download_voices",

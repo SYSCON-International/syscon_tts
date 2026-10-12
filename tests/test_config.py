@@ -81,6 +81,7 @@ def test_describe_is_json_safe(monkeypatch):
         "voices_manifest", "extra_manifest", "voices_dir", "alerts_dir",
         "host", "port", "default_voice", "default_voices", "max_text_chars",
         "max_alert_chars", "max_loaded_voices", "threads", "file_mode", "dir_mode",
+        "worker_isolation", "worker_user",
     }
     assert all(
         v is None or isinstance(v, (str, int, dict)) for v in described.values()

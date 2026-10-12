@@ -180,6 +180,38 @@ def test_for_language_prefers_the_exact_locale(tmp_path):
     assert any(p.language == "es_ES" for p in matches)
 
 
+def test_lineage_override_holds_the_lessac_spanish_voices():
+    # Both Spanish voices have a permissive *dataset* license but a model
+    # lineage that traces to the research-only lessac voice, so they must not
+    # ship to a customer uncleared. The interim Castilian substitute is clean.
+    reg = VoiceRegistry.from_manifest(default_manifest_path(), Path("."))
+    for voice_id in ("es_mx_ald", "es_es_davefx"):
+        profile = reg.get(voice_id)
+        assert license_key(profile.license) in PERMISSIVE_LICENSES  # dataset is fine
+        assert profile.requires_license_review, voice_id            # lineage is not
+        assert "lessac" in profile.lineage.lower(), voice_id
+    carlfm = reg.get("es_es_carlfm")
+    assert not carlfm.requires_license_review
+    assert carlfm.language == "es_ES"
+
+
+def test_license_review_override_wins_over_dataset_license():
+    base = dict(
+        id="x", name="x", language="en_US", gender="x",
+        model="x.onnx", config="x.json",
+    )
+    # Default: the dataset license decides.
+    assert not VoiceProfile(**base, license="CC0").requires_license_review
+    # true forces review even though the dataset license is permissive.
+    assert VoiceProfile(
+        **base, license="CC0", license_review_required=True
+    ).requires_license_review
+    # false clears a voice a reviewer has signed off on.
+    assert not VoiceProfile(
+        **base, license="unknown", license_review_required=False
+    ).requires_license_review
+
+
 def test_default_for_language_prefers_installed_voices(tmp_path):
     voices_dir = tmp_path / "voices"
     _install(voices_dir, "es_ES-davefx-medium", "es_ES")

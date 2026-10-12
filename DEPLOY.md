@@ -118,6 +118,32 @@ not change the exact `piper-tts==1.2.0` pin, without legal review; a test
 fails if the pin moves. See the README's
 [Engine licensing](README.md#engine-licensing) section.
 
+### Synthesis runs in an isolated worker process
+
+The `espeak-ng` that `piper-phonemize 1.1.0` bundles (a 2023 build) can
+**segfault on crafted text** — reproduced at 150–200 characters, inside the
+APU's 200-character public-address limit. Synthesis therefore does **not** run
+in the process that calls `ensure()`. On a host that can run Piper,
+`AlertSynthesizer` spawns a separate worker process for it, so a crash there
+surfaces as a `SynthesisError` the caller catches (the APU already swallows it
+and the announcement simply goes silent) instead of taking down the root
+Tornado socket manager and every websocket it serves. The worker keeps the
+voice-model cache, so isolation costs nothing per announcement; it is spawned
+lazily on the first cache miss and respawned if it ever dies.
+
+**Set `SYSCON_TTS_WORKER_USER` on the APU** (or pass `worker_user=` in code)
+to an unprivileged account that can *read* the voices directory — the worker
+only reads models and returns audio; the caller writes the WAV. Because the
+APU's Tornado runs as root, this is what keeps a memory-corruption bug from
+having root to work with. Leave it unset only on hosts where the service is
+already unprivileged.
+
+Isolation can be turned off with `SYSCON_TTS_WORKER_ISOLATION=0` (or
+`worker_isolation=False`) — do this only to diagnose, never on an APU. When
+you capture a crashing message, add it to the worker tests
+(`tests/test_worker.py`) so CI keeps proving the isolation holds; the suite
+already exercises a worker crash on every platform via the self-test hook.
+
 ---
 
 ## 2. Replace `call_tts()` in the APU
@@ -213,9 +239,23 @@ Three changes from the VoiceText version worth calling out:
    a symlink between the rename and the chown. Root would then chown or chmod
    whatever the symlink points at, such as `/etc/shadow`. The file does not
    need www-data ownership: `0644` already lets the web server read it, and
-   root does the deleting. Create the directory with
-   `create_directory_at_path_and_set_ownership` during setup rather than
-   letting `ensure()` create it.
+   root does the deleting. Create the directory once, at provisioning time,
+   and set ownership on the directory itself — never with a helper that walks
+   its contents:
+
+   ```bash
+   install -d -o root -g www-data -m 0770 "$MEDIA_ROOT/public_alert_sounds"
+   ```
+
+   Do **not** use `create_directory_at_path_and_set_ownership` (or any helper
+   that runs `chown`/`chmod` by path over every entry in the directory). Those
+   walks follow symlinks and run as root on a www-data-writable directory, so a
+   planted symlink gets its target re-owned `root:www-data 0770` — a direct
+   root-escalation route (read `/etc/shadow`, drop a sudoers file). Setting the
+   mode on the directory once, at creation, needs no such walk. `ensure()` also
+   creates the directory safely on its own (`O_NOFOLLOW`, mode on the
+   descriptor) if you would rather not pre-create it; what must not happen is a
+   recurring root chown/chmod walk over its contents.
 3. **The file name comes from the package, not `get_valid_filename`.**
    The package's name is the first 41 sanitized characters plus a hash of the
    full text and voice (50 characters at most). The old `[:50]` truncation gave
@@ -265,8 +305,33 @@ Per-language defaults let one site announce in several languages without any
 APU-side table:
 
 ```
-SYSCON_TTS_DEFAULT_VOICES=es-mx=es_mx_ald,zh-hans=zh_cn_huayan
+SYSCON_TTS_DEFAULT_VOICES=es-mx=es_es_carlfm,zh-hans=zh_cn_huayan
 ```
+
+#### Mexican Spanish is on an interim voice (license hold)
+
+`es_mx_ald`, the native Mexican voice, is **held for license review**: its
+model is fine-tuned from `es_ES-davefx` → `en_US-lessac`, whose Blizzard 2013
+data is research-only and excludes commercial voice synthesis (the dataset
+itself is public domain; the *model lineage* is the problem). `doctor` flags it
+and a bulk `download-voices` skips it until it is cleared.
+
+Until legal signs off, map Mexican Spanish to **`es_es_carlfm`** — cleared for
+commercial use (trained from scratch, public-domain dataset). It is Castilian
+(Spain) accent at `x_low`/16 kHz: intelligible for short PA announcements, not
+native. That is the mapping shown above (`es-mx=es_es_carlfm`).
+
+**To switch back once `es_mx_ald` is cleared** — two edits, both documented in
+`src/syscon_tts/data/voices.json` under `_review_es_mx`:
+
+1. Set `"license_review_required": false` on the `es_mx_ald` entry (that alone
+   makes `doctor` and bulk `download-voices` treat it as cleared again).
+2. Change the default mapping from `es-mx=es_es_carlfm` to `es-mx=es_mx_ald`.
+
+Nothing else references the interim choice. The clean long-term fix is to
+retrain on the (public-domain) Ald Mexican dataset from a non-lessac base such
+as `es_es_carlfm` or from scratch, keeping the Mexican accent without the
+lineage.
 
 Whichever you pick, note that `TTS_VOICE_ID_TO_VOICE_NAME_MAP[int(voice_id)]`
 in `message_controller_initialization` raises `KeyError` on the fixture default
@@ -525,6 +590,8 @@ APU:
 | `SYSCON_TTS_THREADS` | unset (one per physical core) | CPU threads per synthesis (§7) |
 | `SYSCON_TTS_MAX_ALERT_CHARS` | `1000` | Longest alert text `ensure()` accepts |
 | `SYSCON_TTS_FILE_MODE` | `0644` | Mode for generated audio |
+| `SYSCON_TTS_WORKER_USER` | — | Account the synthesis worker drops to when started as root (set this on the APU) |
+| `SYSCON_TTS_WORKER_ISOLATION` | `1` | Run synthesis in a worker process; `0` disables it (diagnostic only) |
 | `SYSCON_TTS_EXTRA_MANIFEST` | — | Site voices layered over the catalogue |
 | `SYSCON_TTS_MANIFEST` | bundled | Replace the voice catalogue outright |
 

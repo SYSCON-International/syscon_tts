@@ -78,7 +78,7 @@ def test_doctor_reports_the_environment(env, capsys):
     # provisioning should fail loudly rather than at the first announcement.
     assert main(["doctor"]) == 1
     captured = capsys.readouterr()
-    assert "voices installed  0/7" in captured.out
+    assert "voices installed  0/8" in captured.out
     assert "default voice     en_us_kristin" in captured.out
     assert "data dir" in captured.out
     assert "download-voices" in captured.err
