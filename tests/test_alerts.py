@@ -714,3 +714,64 @@ def test_temp_files_use_the_sweepable_prefix(tmp_path, monkeypatch):
     monkeypatch.setattr(alerts_mod.os, "replace", spy)
     build(tmp_path).ensure("Press 4 fault")
     assert seen[0].startswith(".syscon-tts-") and seen[0].endswith(".part")
+
+
+# -- engine selection (C-75: isolation must be wired on by default) -----------
+
+
+def _settings(tmp_path, **overrides):
+    return Settings(
+        voices_manifest=default_manifest_path(),
+        voices_dir=tmp_path / "voices",
+        alerts_dir=tmp_path / "alerts",
+        default_voice="en_us_kristin",
+        **overrides,
+    )
+
+
+def test_build_engine_isolates_in_a_worker_when_piper_runs(monkeypatch, tmp_path):
+    # The whole espeak-ng containment hinges on this wiring: when Piper can run
+    # and isolation is on (the default), the alert path must get a WorkerEngine,
+    # not the in-process engine. The worker is spawned lazily, so building one
+    # here starts no subprocess.
+    from syscon_tts.worker import WorkerEngine
+
+    monkeypatch.setattr(alerts_mod, "piper_available", lambda: True)
+    settings = _settings(tmp_path)
+    registry = VoiceRegistry.from_settings(settings)
+    engine = alerts_mod._build_engine(settings, registry)
+    assert isinstance(engine, WorkerEngine)
+
+
+def test_build_engine_honours_isolation_off(monkeypatch, tmp_path):
+    from syscon_tts.engine import TTSEngine
+
+    monkeypatch.setattr(alerts_mod, "piper_available", lambda: True)
+    settings = _settings(tmp_path, worker_isolation=False)
+    registry = VoiceRegistry.from_settings(settings)
+    engine = alerts_mod._build_engine(settings, registry)
+    assert isinstance(engine, TTSEngine)
+
+
+def test_build_engine_stays_in_process_without_piper(monkeypatch, tmp_path):
+    from syscon_tts.engine import TTSEngine
+
+    monkeypatch.setattr(alerts_mod, "piper_available", lambda: False)
+    settings = _settings(tmp_path)  # isolation on, but Piper cannot run
+    registry = VoiceRegistry.from_settings(settings)
+    engine = alerts_mod._build_engine(settings, registry)
+    assert isinstance(engine, TTSEngine)
+
+
+def test_worker_isolation_defaults_on_and_parses_the_env_flag(monkeypatch, tmp_path):
+    from syscon_tts.config import load_settings
+
+    # Default is ON -- a mutation to False would silently restore the crash.
+    assert _settings(tmp_path).worker_isolation is True
+    # The off switch actually parses.
+    for name in ("SYSCON_TTS_WORKER_ISOLATION",):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SYSCON_TTS_WORKER_ISOLATION", "0")
+    assert load_settings(voices_dir=tmp_path).worker_isolation is False
+    monkeypatch.setenv("SYSCON_TTS_WORKER_ISOLATION", "1")
+    assert load_settings(voices_dir=tmp_path).worker_isolation is True

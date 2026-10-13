@@ -36,14 +36,18 @@ classifiers = [
 
 # Piper is installed on Linux only. piper-phonemize 1.1.0 publishes
 # manylinux_2_28 wheels for x86_64 and aarch64 (Python 3.9-3.11) and no sdist,
-# so the marker also pins the architecture: without it, pip on 32-bit ARM,
-# musl (Alpine), or glibc < 2.28 tries to build from an sdist that does not
-# exist and `pip install syscon-tts` fails outright -- breaking the
-# "install never fails off the engine's platform" contract. The host also
-# needs glibc >= 2.28 (RHEL/CentOS 8+, Debian 10+, Ubuntu 18.10+); older
-# distros cannot load the wheel. On every other platform the package still
-# resolves, inspects, and replays previously generated audio. Run
-# `syscon-tts doctor` after installing to confirm which mode you landed in.
+# so the marker also pins the architecture (exact `==` matches, not a substring
+# `in` test): without it, pip on 32-bit ARM, i686, ppc64le, etc. tries to build
+# from an sdist that does not exist and `pip install syscon-tts` fails outright.
+#
+# A marker CANNOT express the libc, so two cases still MATCH this marker yet
+# cannot install the wheel: musl (Alpine) and glibc < 2.28 (pre-RHEL/CentOS 8,
+# pre-Debian 10, pre-Ubuntu 18.10). On those hosts `pip install syscon-tts`
+# fails; install the engine-free package with `pip install --no-deps
+# syscon-tts` (it still resolves, inspects, and replays previously generated
+# audio -- it just cannot synthesize). On every non-Linux platform the package
+# installs cleanly without Piper. Run `syscon-tts doctor` after installing to
+# confirm which mode you landed in.
 #
 # LICENCE: do not bump piper-tts past 1.2.x without legal review.
 #   * piper-tts 1.2.0 is MIT, but its piper-phonemize dependency bundles
@@ -53,7 +57,7 @@ classifiers = [
 # question, not a routine upgrade. tests/test_config.py fails if the pin
 # moves. See README, "Engine licensing".
 dependencies = [
-    "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12' and platform_machine in 'x86_64 aarch64'",
+    "piper-tts==1.2.0; sys_platform == 'linux' and python_version < '3.12' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]

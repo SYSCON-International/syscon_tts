@@ -10,23 +10,36 @@ fallback behind it.
 
 ## 1. Install
 
+# In the commands below, `<apu-venv>` is the APU's own virtualenv (the one the
+# Tornado managers run from), not a separate one — install into that, or the
+# library the APU imports is a different install from the one you pinned.
+
 ```bash
 # Confirm the interpreter is in range first:
-python3 --version            # must be 3.9.x / 3.10.x / 3.11.x
+<apu-venv>/bin/python --version      # must be 3.9.x / 3.10.x / 3.11.x
 
-# Install into the APU's own virtualenv, PINNED. An unpinned
-# `pip install syscon-tts` floats the version and the native runtime
-# (onnxruntime, piper-phonemize, protobuf, flatbuffers), so two sites
-# provisioned weeks apart run different engines and crash reports stop being
-# reproducible. Pin syscon-tts and lock the native deps with hashes:
-/opt/syscon-tts/.venv/bin/pip install --require-hashes -r requirements-tts.lock
-# where requirements-tts.lock pins syscon-tts==<this release> and its
-# transitive onnxruntime / piper-phonemize / protobuf / flatbuffers to exact
-# versions + sha256 (generate it once per release with `pip-compile
-# --generate-hashes`, and reuse it for the air-gapped wheelhouse in §6).
+# PINNED install. A bare `pip install syscon-tts` is wrong twice over: it floats
+# the native runtime (onnxruntime, piper-phonemize, protobuf, flatbuffers), so
+# two sites provisioned weeks apart run different engines, AND it can resolve to
+# the mistaken 0.1.0 upload (slated to be yanked). Always pin the version.
 
-syscon-tts download-voices --language en-us   # one-time, needs internet
-syscon-tts doctor                             # must report "Ready."
+# Preferred — hash-locked, fully reproducible. The lock is published as a GitHub
+# release asset per version, built ON LINUX/py3.11 (a lock generated on Windows
+# or macOS omits piper-tts, because the dependency marker excludes those
+# platforms). Download the asset for THIS release, then:
+<apu-venv>/bin/pip install --require-hashes -r requirements-tts-<version>-linux-py311.txt
+
+# Fallback if you cannot use the lock — still pinned to an exact version, just
+# without transitive hash pinning (NOT a bare float):
+<apu-venv>/bin/pip install "syscon-tts==<this release>"
+
+# To regenerate the lock for a release, run on a Linux/py3.11 host:
+#   pip-compile --generate-hashes --output-file requirements-tts-<version>-linux-py311.txt \
+#       <(echo "syscon-tts==<this release>")
+# and attach it to the release (it doubles as the air-gapped wheelhouse input, §6).
+
+<apu-venv>/bin/syscon-tts download-voices --language en-us   # one-time, needs internet
+<apu-venv>/bin/syscon-tts doctor                             # must report "Ready."
 ```
 
 The host also needs **glibc ≥ 2.28** (RHEL/CentOS 8+, Debian 10+,
@@ -38,20 +51,31 @@ see pyproject's dependency comment.
 > checks the package defaults — `/var/lib/syscon-tts/voices` and the bundled
 > catalogue. The APU embeds the library with its *own* paths and catalogue, so
 > a bare `doctor` can print "Ready." while the PA page reports "not installed."
-> Run the gate with the APU's environment so it checks the real target, and
-> name the languages the site announces in (see C-9, `doctor --language`):
+> **On the APU, ignore the `/var/lib` path entirely** (that is the standalone
+> default, not the APU's) and run the gate with the APU's environment, from the
+> APU's venv, as a user that can read the voices directory — on a `0770`
+> voices dir that means root (`sudo`) or a `www-data`-group account:
 >
 > ```bash
-> SYSCON_TTS_VOICES_DIR="$BASE_DIR/text_to_speech_voices" \
-> SYSCON_TTS_MANIFEST="<the APU's voice catalogue JSON>" \
->   syscon-tts doctor --language es-mx
+> sudo env \
+>   SYSCON_TTS_VOICES_DIR="$BASE_DIR/text_to_speech_voices" \
+>   SYSCON_TTS_MANIFEST="$BASE_DIR/.../text_to_speech_voice_catalogue.json" \
+>   SYSCON_TTS_WORKER_USER=<the worker account> \
+>   <apu-venv>/bin/syscon-tts doctor --language es-mx
 > ```
 >
-> Confirm `$BASE_DIR` and the catalogue path against the APU's Django settings;
-> they are **not** the package defaults. Also note: a non-root
-> `download-voices` on a fresh box lands models in `~/.local/share`, not
-> `/var/lib` — run provisioning as the account (and with the paths) the APU
-> uses, or `doctor` and the APU will look in different places.
+> Fill `$BASE_DIR` and the catalogue path from the APU's Django settings — they
+> are **not** the package defaults, and `syscon-tts` is on the venv's PATH, not
+> root's. Running it as root also lets `doctor` exercise the real worker drop to
+> `SYSCON_TTS_WORKER_USER` (C-66).
+>
+> **What this gate still cannot see**, so check it separately: it validates the
+> voice configured in the *catalogue/env*, not the per-site **TTS Voice
+> Overrides** value the APU may have stored (that lives in the APU DB); and it
+> does not know the APU catalogue's own license state — a voice held in the
+> package catalogue (es_mx_ald, fr_fr_siwis, …) is only held on the APU if the
+> APU catalogue mirrors the hold (C-63). Confirm the overrides value and the
+> APU catalogue's holds by hand.
 
 `doctor` is the gate. It exits non-zero and explains the problem if Piper is
 missing on a Linux host, if no models are on disk, if an installed model does
@@ -162,21 +186,57 @@ in the process that calls `ensure()`. On a host that can run Piper,
 surfaces as a `SynthesisError` the caller catches (the APU already swallows it
 and the announcement simply goes silent) instead of taking down the root
 Tornado socket manager and every websocket it serves. The worker keeps the
-voice-model cache, so isolation costs nothing per announcement; it is spawned
-lazily on the first cache miss and respawned if it ever dies.
+voice-model cache, so isolation costs nothing in *per-announcement latency* (the
+cache lives in the worker and is reused); it does cost one extra resident
+process holding the models — see §7 "Memory". It is spawned lazily on the first
+cache miss and respawned if it ever dies.
 
-**Set `SYSCON_TTS_WORKER_USER` on the APU** (or pass `worker_user=` in code)
-to an unprivileged account that can *read* the voices directory — the worker
-only reads models and returns audio; the caller writes the WAV. Because the
-APU's Tornado runs as root, this is what keeps a memory-corruption bug from
-having root to work with. Leave it unset only on hosts where the service is
-already unprivileged.
+**Set `SYSCON_TTS_WORKER_USER` on the APU** (or pass `worker_user=` in code).
+Because the APU's Tornado runs as root, this is what keeps a memory-corruption
+bug from having root to work with. Isolation contains the *crash* either way,
+but a fault in a worker that is still root is corruption with root's privileges,
+so this is not optional on the APU. **If it is unset and the worker would run as
+root, the first synthesis logs a warning** (`Synthesis worker is running as
+root…`) — treat that line in the APU log as a provisioning defect, not noise.
+
+The account has to be able to *read* the voices directory — and on the APU that
+directory is `root:www-data 0770`, so a brand-new dedicated account **fails
+silently**: the worker cannot open the models and every announcement dies with
+`VoiceNotInstalledError`. `doctor` now catches this (it loads a voice through a
+real worker; run it as root on the APU so it exercises the drop), but choose one
+of these so it never happens:
+
+- **A dedicated `syscon-tts` account, added to group `www-data`.** It then has
+  the group's read access to `0770`, and shares nothing else with the web
+  server. Create it as a system account with no login shell:
+  `sudo useradd --system --no-create-home --shell /usr/sbin/nologin -g www-data syscon-tts`,
+  then `SYSCON_TTS_WORKER_USER=syscon-tts`. **Preferred.**
+- **A dedicated group on a tighter voices directory.** Make the voices dir
+  `root:<ttsgroup> 0750` with models `0640` (this also satisfies C-5 part 2 —
+  www-data should not be able to *write* models the root process loads), add the
+  worker account to `<ttsgroup>`, and set `SYSCON_TTS_WORKER_USER` to it.
+
+Do **not** set it to `www-data` itself: that shares the web server's uid, so a
+compromised web process could `ptrace` the worker, read its `/proc`, or
+`SIGSTOP` it (which the `SYSCON_TTS_WORKER_TIMEOUT` below then has to clean up).
+Use a separate account.
+
+The worker reads models and returns audio over a hardened channel: the root
+caller never unpickles what the worker sends (replies are length-framed bytes
+decoded as JSON, not a pickle stream), so a compromised worker cannot pivot
+into the parent. A worker that *hangs* rather than crashes — crafted text that
+sends espeak-ng into a loop — is bounded by `SYSCON_TTS_WORKER_TIMEOUT`
+(default 30 s): past it the worker is killed and the call raises
+`SynthesisError`. Lower it only if an announcement should fail faster; a
+200-character alert renders in well under a second.
 
 Isolation can be turned off with `SYSCON_TTS_WORKER_ISOLATION=0` (or
 `worker_isolation=False`) — do this only to diagnose, never on an APU. When
 you capture a crashing message, add it to the worker tests
 (`tests/test_worker.py`) so CI keeps proving the isolation holds; the suite
-already exercises a worker crash on every platform via the self-test hook.
+already drives a crash *and* a hang through `AlertSynthesizer.ensure()` on
+every platform via the self-test hook, and against real Piper in the Linux
+`synthesis` CI job.
 
 ---
 
@@ -332,14 +392,27 @@ on open. Match the APU's own `prepare_text_to_speech`:
 ```python
 async def message_controller_initialization(self):
     ...
-    async def _warm():
+    language = self.tts_language
+
+    def _warm():
+        # Build the synthesizer AND preload inside the executor. The FIRST
+        # _synthesizer() call constructs it -- loads settings, builds the
+        # registry, imports piper -- which is itself ~0.1-0.2 s and must not run
+        # on the IO loop either. Evaluating _synthesizer() in the run_in_executor
+        # arguments (the obvious way) would run that part on the loop.
+        _synthesizer().preload(language=language)
+
+    async def _warm_async():
         try:
-            await asyncio.get_running_loop().run_in_executor(
-                None, _synthesizer().preload, None, self.tts_language
-            )
+            await asyncio.get_running_loop().run_in_executor(None, _warm)
         except Exception:
-            logger.warning("TTS preload skipped (no model or no Piper here)")
-    asyncio.ensure_future(_warm())   # fire-and-forget; do not await
+            # exc_info keeps the traceback: a preload failure is how you learn
+            # the model or Piper is missing, so do not throw it away.
+            logger.warning("TTS preload skipped", exc_info=True)
+
+    # Keep a reference: asyncio holds only a weak reference to a bare task, so a
+    # fire-and-forget `ensure_future(...)` can be garbage-collected mid-flight.
+    self._tts_warm_task = asyncio.ensure_future(_warm_async())
 ```
 
 (`_synthesizer()` is the module-level cached `AlertSynthesizer` from §2, not a
@@ -381,33 +454,60 @@ Per-language defaults let one site announce in several languages without any
 APU-side table:
 
 ```
-SYSCON_TTS_DEFAULT_VOICES=es-mx=es_es_carlfm,zh-hans=zh_cn_huayan
+SYSCON_TTS_DEFAULT_VOICES=es-mx=es_es_carlfm
 ```
 
-#### Mexican Spanish is on an interim voice (license hold)
+#### Several native voices are held for license review (lessac lineage)
 
-`es_mx_ald`, the native Mexican voice, is **held for license review**: its
-model is fine-tuned from `es_ES-davefx` → `en_US-lessac`, whose Blizzard 2013
-data is research-only and excludes commercial voice synthesis (the dataset
-itself is public domain; the *model lineage* is the problem). `doctor` flags it
-and a bulk `download-voices` skips it until it is cleared.
+Five catalogued voices are fine-tuned from `en_US-lessac`, whose Blizzard 2013
+data is research-only and excludes commercial voice synthesis. The *dataset*
+license of each is fine (public domain / CC0 / CC BY 4.0, or Unknown for
+Huayan); the **model lineage** is the problem. Each is therefore **held for
+license review** — `doctor` flags it and a bulk `download-voices` skips it —
+until legal signs off on the lineage:
 
-Until legal signs off, map Mexican Spanish to **`es_es_carlfm`** — cleared for
-commercial use (trained from scratch, public-domain dataset). It is Castilian
-(Spain) accent at `x_low`/16 kHz: intelligible for short PA announcements, not
-native. That is the mapping shown above (`es-mx=es_es_carlfm`).
+| Language | Held voice | Cleared substitute in this catalogue |
+| --- | --- | --- |
+| Spanish (Mexico) | `es_mx_ald` | **`es_es_carlfm`** (interim — see below) |
+| Spanish (Spain) | `es_es_davefx` | `es_es_carlfm` |
+| French | `fr_fr_siwis` | **none** |
+| German | `de_de_thorsten` | **none** |
+| Mandarin Chinese | `zh_cn_huayan` | **none** (also held for an Unknown dataset license) |
 
-**To switch back once `es_mx_ald` is cleared** — two edits, both documented in
-`src/syscon_tts/data/voices.json` under `_review_es_mx`:
+Only Spanish has a cleared stand-in. **French, German and Chinese have no
+cleared voice in this catalogue**, so until the lineage is cleared a site in
+those languages falls back to the default English voice (an announcement in the
+wrong language). Options for those locales: wait for legal sign-off, add a
+cleared voice for the locale via `SYSCON_TTS_EXTRA_MANIFEST`, or have the
+operator explicitly accept the risk. Do **not** quietly map `fr`/`de`/`zh` to a
+held voice. (This is why the per-language example above no longer includes
+`zh-hans=zh_cn_huayan` — Huayan is held.)
 
-1. Set `"license_review_required": false` on the `es_mx_ald` entry (that alone
-   makes `doctor` and bulk `download-voices` treat it as cleared again).
-2. Change the default mapping from `es-mx=es_es_carlfm` to `es-mx=es_mx_ald`.
+For **Mexican Spanish**, map to **`es_es_carlfm`** — cleared for commercial use
+(trained from scratch, public-domain dataset). It is Castilian (Spain) accent at
+`x_low`/16 kHz: intelligible for short PA announcements, not native. That is the
+mapping shown above (`es-mx=es_es_carlfm`).
 
-Nothing else references the interim choice. The clean long-term fix is to
-retrain on the (public-domain) Ald Mexican dataset from a non-lessac base such
-as `es_es_carlfm` or from scratch, keeping the Mexican accent without the
-lineage.
+**To clear the family once legal signs off on the lessac lineage** — set
+`"license_review_required": false` on `es_mx_ald`, `es_es_davefx`,
+`fr_fr_siwis` and `de_de_thorsten` in `src/syscon_tts/data/voices.json` (that
+alone makes `doctor` and bulk `download-voices` treat them as cleared), and
+change any interim mapping (e.g. `es-mx=es_es_carlfm` → `es-mx=es_mx_ald`).
+`zh_cn_huayan` is **not** cleared by that step — its Unknown dataset license is
+a separate hold. The whole plan is in `voices.json` under `_review_lessac` and
+`_review_es_mx`. The clean long-term fix for any locale is to retrain on its own
+permissive dataset from a non-lessac base.
+
+> **⚠️ The APU has its own voice catalogue — these holds do not reach it
+> automatically.** `plantstar_apu` ships its own
+> `text_to_speech_voice_catalogue.json`, which is authoritative for the APU and
+> its Text To Speech Voices page, and the APU's explicit `voice=` ids override
+> the `SYSCON_TTS_DEFAULT_VOICES` mapping above. So a hold set here does nothing
+> on the APU until the APU catalogue mirrors it. The APU must mark the same five
+> voices held, add `es_es_carlfm`, and skip held voices in its download/overrides
+> view — see **`SECURITY_HANDOFF_APU_TTS.md` → "C-63"**. The durable fix is for
+> the APU to consume this catalogue (`SYSCON_TTS_MANIFEST`) or generate its own
+> from it, so there is one source of truth.
 
 Whichever you pick, note that `TTS_VOICE_ID_TO_VOICE_NAME_MAP[int(voice_id)]`
 in `message_controller_initialization` raises `KeyError` on the fixture default
@@ -605,24 +705,32 @@ trade-off on the actual hardware with `syscon-tts benchmark --threads N`
 
 Each resident `medium` model costs roughly **139 MB** of RSS once it has
 rendered once — the model plus the onnxruntime inference arena, which is
-allocated on the first synthesis, not at load. Budget another ~37 MB per
-process for the Python runtime and onnxruntime itself. These are the
-`syscon-tts benchmark` figures after a warm render; measure on your own
-hardware.
+allocated on the first synthesis, not at load. These are the `syscon-tts
+benchmark` figures after a warm render; measure on your own hardware.
 
-The engine keeps up to `SYSCON_TTS_MAX_LOADED_VOICES` (default 3) loaded and
-evicts least-recently-used beyond that. A trilingual site at the default holds
-~3 × 139 MB + 37 MB ≈ **0.45 GB per process**, and **both** the HTTP and HTTPS
-Tornado socket managers load their own copies — so **~0.9 GB** for the pair.
-That can push an APU into swap or the OOM killer, whose symptom is slow or
-dropped announcements.
+**With worker isolation on (the APU default), the models live in the worker
+process, not in the Tornado manager.** So budget per manager as two parts:
+
+- the **manager** itself: the Python runtime plus this package and its registry,
+  but *no* onnx models and no inference arena — onnxruntime is imported only in
+  the worker. Call it ~40–80 MB on top of whatever Django already costs.
+- the **worker**: a clean `python -I` interpreter (~40 MB base — it does **not**
+  re-import the embedder's Django app; that is the point of the subprocess
+  worker) plus `SYSCON_TTS_MAX_LOADED_VOICES` × ~139 MB.
+
+With one resident voice that is roughly **40–80 MB (manager) + ~180 MB
+(worker) ≈ 0.22–0.26 GB per manager**, and **both** the HTTP and HTTPS Tornado
+managers run their own pair — so **~0.5 GB** for the site at one voice each, and
+about 0.65 GB more for every additional resident voice across the two workers.
+An unbounded `MAX_LOADED_VOICES` on a multilingual site is what pushes an APU
+into swap or the OOM killer, whose symptom is slow or dropped announcements.
 
 **For the APU, set `SYSCON_TTS_MAX_LOADED_VOICES=1` (or 2 for a bilingual
 site) and `SYSCON_TTS_THREADS=2`.** One or two resident voices covers almost
 every site, and capping threads leaves CPU for machine monitoring during a
-render. Earlier guidance here said 50–120 MB per voice and ~180 MB for a
-trilingual site; that under-counted the arena and the second process by about
-three times. Re-size any APU provisioned against the old numbers.
+render. Earlier guidance here said 50–120 MB per voice and ignored both the
+arena and the worker process; re-size any APU provisioned against the old
+numbers.
 
 ### Benchmarking (post-deployment)
 
@@ -683,6 +791,7 @@ APU:
 | `SYSCON_TTS_FILE_MODE` | `0644` | Mode for generated audio |
 | `SYSCON_TTS_WORKER_USER` | — | Account the synthesis worker drops to when started as root (set this on the APU) |
 | `SYSCON_TTS_WORKER_ISOLATION` | `1` | Run synthesis in a worker process; `0` disables it (diagnostic only) |
+| `SYSCON_TTS_WORKER_TIMEOUT` | `30` | Seconds a synthesis request waits before the worker is killed as hung |
 | `SYSCON_TTS_EXTRA_MANIFEST` | — | Site voices layered over the catalogue |
 | `SYSCON_TTS_MANIFEST` | bundled | Replace the voice catalogue outright |
 

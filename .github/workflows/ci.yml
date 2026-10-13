@@ -135,10 +135,12 @@ jobs:
       - name: Install with the real engine
         # Every unit test fakes piper and onnxruntime, so the hand-copied
         # PiperVoice.load path and the floating onnxruntime are never actually
-        # exercised. This job runs the real thing end to end.
+        # exercised. This job runs the real thing end to end. `dev` is needed so
+        # pytest is present for the worker tests below (without it the worker
+        # step failed to even start -- CI was red on main).
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[piper]"
+          pip install -e ".[piper,dev]"
       - name: Download one voice and synthesize
         env:
           SYSCON_TTS_VOICES_DIR: ${{ runner.temp }}/voices
@@ -146,6 +148,9 @@ jobs:
         run: |
           syscon-tts download-voices en_us_kristin
           syscon-tts doctor --language en-us
+          # `alert` renders through AlertSynthesizer -> the worker process, the
+          # exact APU path. `speak` is a secondary check of the in-process path.
+          syscon-tts alert "Machine four fault detected." --voice en_us_kristin
           syscon-tts speak -v en_us_kristin -o "${{ runner.temp }}/hi.wav" "Machine four fault detected."
           # A real WAV, non-trivial size.
           python - <<'PY'
@@ -156,11 +161,60 @@ jobs:
           assert frames > 1000, f"suspiciously short audio: {frames} frames"
           print(f"synthesized {frames} frames OK")
           PY
-      - name: espeak-ng crash vectors do not take the process down
-        # The pinned espeak-ng can segfault on crafted text; syscon_tts isolates
-        # synthesis in a worker so that surfaces as SynthesisError. Exercise the
-        # isolation against real Piper. (Add captured crash strings here as they
-        # are collected; the worker self-test proves the mechanism meanwhile.)
+      - name: Worker tests against the real engine (success path + crash + hang)
+        # With real Piper and a model installed, these drive the worker's
+        # SUCCESS path (test_worker_renders_real_audio_end_to_end, previously
+        # never exercised by any test), plus a crash and a hang through
+        # AlertSynthesizer.ensure() -- the exact APU path. (Add captured espeak-ng
+        # crash strings to the self-test corpus as they are collected; the
+        # self-test hook proves the mechanism deterministically meanwhile.)
         env:
           SYSCON_TTS_VOICES_DIR: ${{ runner.temp }}/voices
         run: pytest -q tests/test_worker.py
+      - name: The worker drops privileges when run under sudo (worker_user)
+        # The privilege-separation path (Popen user=/group=) only activates as
+        # root, which no unit test can cover. Render one alert as root with
+        # SYSCON_TTS_WORKER_USER=nobody and confirm it still produces audio --
+        # i.e. the dropped worker can read the voices and the root parent never
+        # ran espeak-ng. Models must be group/other-readable for `nobody`.
+        run: |
+          sudo chmod -R a+rX "${{ runner.temp }}/voices"
+          sudo env \
+            SYSCON_TTS_VOICES_DIR="${{ runner.temp }}/voices" \
+            SYSCON_TTS_ALERTS_DIR="${{ runner.temp }}/alerts_root" \
+            SYSCON_TTS_WORKER_USER=nobody \
+            "$(which syscon-tts)" alert "Dropped worker announcement." --voice en_us_kristin
+          test -n "$(ls -A "${{ runner.temp }}/alerts_root")" || { echo "::error::no alert WAV from the dropped worker"; exit 1; }
+      - name: The alert path survives a worker crash and keeps serving (real Piper)
+        # Medium #20, made explicit outside pytest: a crash in the worker must
+        # surface to the caller as a catchable error, and the very next alert
+        # must still synthesize. This is the property the root Tornado manager
+        # depends on, exercised against the real engine, not the self-test stub
+        # alone.
+        env:
+          SYSCON_TTS_VOICES_DIR: ${{ runner.temp }}/voices
+          SYSCON_TTS_ALERTS_DIR: ${{ runner.temp }}/alerts2
+          SYSCON_TTS_WORKER_SELFTEST: "1"
+        run: |
+          python - <<'PY'
+          from syscon_tts.alerts import AlertSynthesizer
+          from syscon_tts.engine import SynthesisError, piper_available
+          from syscon_tts.worker import _CRASH_SENTINEL, WorkerEngine
+          from syscon_tts.config import load_settings
+
+          assert piper_available(), "this job must run with real Piper"
+          settings = load_settings(default_voice="en_us_kristin")
+          synth = AlertSynthesizer(settings=settings, engine=WorkerEngine(settings))
+          try:
+              try:
+                  synth.ensure(_CRASH_SENTINEL)
+              except SynthesisError:
+                  pass  # the caller survived the worker crash
+              else:
+                  raise SystemExit("a worker crash did not surface as SynthesisError")
+              audio = synth.ensure("Machine four fault detected.")
+              assert audio.path.is_file(), "no alert WAV after the crash"
+              print("alert path recovered after a worker crash OK")
+          finally:
+              synth.engine.close()
+          PY

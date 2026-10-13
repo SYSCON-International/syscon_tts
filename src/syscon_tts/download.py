@@ -258,21 +258,42 @@ def download_voices(
         profiles = registry.all()
         if language:
             matches = registry.for_language(language)
-            # Exact locale only when there is one: a site asking for es-MX
-            # should not also pull 60 MB of Castilian it will never play. If
-            # nothing matches exactly, the related-language voices are the
-            # only way that site gets audio at all, so fetch those.
-            wanted = normalize_language(language)
-            profiles = [p for p in matches if p.language == wanted] or matches
-            if not profiles:
+            if not matches:
                 raise DownloadError(
                     f"No voice in the catalogue for language '{language}'. "
                     f"Known languages: {', '.join(registry.languages())}."
                 )
+            profiles = matches
+
+        # Held voices are filtered out BEFORE narrowing to the exact locale.
+        # Otherwise a site asking for es-MX narrows to the held es_mx_ald, which
+        # is then dropped, so the command installs nothing and exits 0 -- the
+        # Spanish site silently announces in English (C-69). Filtering first
+        # lets the cleared related-locale voice (es_es_carlfm) survive.
         skipped = []
         if not accept_license:
             skipped = [p for p in profiles if p.requires_license_review]
             profiles = [p for p in profiles if not p.requires_license_review]
+
+        if language:
+            # Every voice for this locale is held: say so loudly instead of
+            # exiting 0 with an empty voices directory.
+            if not profiles:
+                held = ", ".join(p.id for p in skipped) or "none"
+                raise DownloadError(
+                    f"Every voice for language '{language}' is held for license "
+                    f"review ({held}). Clear it and re-run with --accept-license, "
+                    "or name a cleared voice explicitly (e.g. "
+                    "download-voices es_es_carlfm)."
+                )
+            # Prefer the exact locale among what is left: a site asking for es-MX
+            # should not also pull Castilian it will never play -- but only now
+            # that held voices are gone, so the fallback is a cleared voice.
+            wanted = normalize_language(language)
+            exact = [p for p in profiles if p.language == wanted]
+            if exact:
+                profiles = exact
+
         for profile in skipped:
             if on_progress:
                 on_progress(

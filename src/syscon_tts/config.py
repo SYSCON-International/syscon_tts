@@ -84,8 +84,19 @@ DEFAULT_MAX_LOADED_VOICES = 3
 #: plant floor wants to hear.
 DEFAULT_MAX_ALERT_CHARS = 1000
 
-#: Longest text the HTTP ``/synthesize`` endpoint accepts.
-DEFAULT_MAX_TEXT_CHARS = 20000
+#: Longest text the HTTP ``/synthesize`` endpoint accepts. Each character of
+#: un-punctuated text costs Piper on the order of a megabyte of RSS while it is
+#: synthesized (one long utterance is not split internally), so the old 20000
+#: let one unauthenticated request ask for tens of gigabytes. 2000 bounds a
+#: request to a couple of GB; lower it further on a small box, and keep
+#: ``max_alert_chars`` modest for the same reason.
+DEFAULT_MAX_TEXT_CHARS = 2000
+
+#: How many ``/synthesize`` requests the HTTP server runs at once; the rest get
+#: 503. Synthesis is CPU-bound and memory scales with text length, so admitting
+#: everything at once is how a burst OOMs the host. 1 is right for the APU-class
+#: boxes this smoke-test server runs on.
+DEFAULT_MAX_CONCURRENT_SYNTHESIS = 1
 
 
 def default_manifest_path() -> Path:
@@ -208,6 +219,9 @@ class Settings:
     max_text_chars: int = DEFAULT_MAX_TEXT_CHARS
     max_alert_chars: int = DEFAULT_MAX_ALERT_CHARS
     max_loaded_voices: int = DEFAULT_MAX_LOADED_VOICES
+    # How many HTTP /synthesize requests run concurrently before the rest get
+    # 503. Guards the server against a memory-stacking burst.
+    max_concurrent_synthesis: int = DEFAULT_MAX_CONCURRENT_SYNTHESIS
     # onnxruntime intra-op threads per synthesis. None keeps onnxruntime's
     # default of one per physical core, which saturates the whole CPU for the
     # length of each utterance -- set it on a host with other work to do.
@@ -224,6 +238,13 @@ class Settings:
     # APU case). It only needs to read the voices directory. None keeps the
     # worker as whatever user started it.
     worker_user: Optional[str] = None
+    # Seconds the caller waits for a worker reply before giving up on it. A
+    # crafted input that makes espeak-ng *hang* (rather than crash) would
+    # otherwise block the announcement forever; past this the worker is killed
+    # and the call raises SynthesisError, and the next call respawns a clean
+    # one. A 200-character alert renders in well under a second, so the default
+    # is generous.
+    worker_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         # Validating here rather than in load_settings also covers callers who
@@ -247,11 +268,13 @@ class Settings:
             "max_text_chars": self.max_text_chars,
             "max_alert_chars": self.max_alert_chars,
             "max_loaded_voices": self.max_loaded_voices,
+            "max_concurrent_synthesis": self.max_concurrent_synthesis,
             "threads": self.threads,
             "file_mode": f"{self.file_mode:04o}",
             "dir_mode": f"{self.dir_mode:04o}",
             "worker_isolation": self.worker_isolation,
             "worker_user": self.worker_user,
+            "worker_timeout": self.worker_timeout,
         }
 
 
@@ -259,10 +282,12 @@ _PATH_FIELDS = frozenset(
     {"voices_manifest", "extra_manifest", "voices_dir", "alerts_dir"}
 )
 _INT_FIELDS = frozenset(
-    {"port", "max_text_chars", "max_alert_chars", "max_loaded_voices", "threads"}
+    {"port", "max_text_chars", "max_alert_chars", "max_loaded_voices",
+     "max_concurrent_synthesis", "threads"}
 )
 _MODE_FIELDS = frozenset({"file_mode", "dir_mode"})
 _BOOL_FIELDS = frozenset({"worker_isolation"})
+_FLOAT_FIELDS = frozenset({"worker_timeout"})
 _OPTIONAL_FIELDS = frozenset({"extra_manifest", "threads", "worker_user"})
 
 #: The environment variable behind each setting.
@@ -278,11 +303,13 @@ ENV_NAMES = {
     "max_text_chars": "SYSCON_TTS_MAX_CHARS",
     "max_alert_chars": "SYSCON_TTS_MAX_ALERT_CHARS",
     "max_loaded_voices": "SYSCON_TTS_MAX_LOADED_VOICES",
+    "max_concurrent_synthesis": "SYSCON_TTS_MAX_CONCURRENT_SYNTHESIS",
     "threads": "SYSCON_TTS_THREADS",
     "file_mode": "SYSCON_TTS_FILE_MODE",
     "dir_mode": "SYSCON_TTS_DIR_MODE",
     "worker_isolation": "SYSCON_TTS_WORKER_ISOLATION",
     "worker_user": "SYSCON_TTS_WORKER_USER",
+    "worker_timeout": "SYSCON_TTS_WORKER_TIMEOUT",
 }
 
 #: Strings that mean "off" for a boolean setting; everything else is true.
@@ -312,8 +339,29 @@ def _coerce(name: str, value: Any) -> Any:
         return {normalize_language(k): str(v) for k, v in dict(value).items()}
     if name in _MODE_FIELDS:
         return parse_mode(value, name)
+    if name == "worker_user":
+        user = str(value).strip()
+        # Catch an obvious typo at config time (an empty or malformed value).
+        # Existence and voices-dir readability are checked by `doctor`, which
+        # can actually spawn a worker; they depend on the host the worker runs
+        # on, not on where settings happen to load.
+        if not user or any(c in user for c in " \t\r\n:\x00/"):
+            raise ValueError(
+                f"worker_user={value!r} is not a valid account name."
+            )
+        return user
     if name in _BOOL_FIELDS:
         return parse_bool(value, name)
+    if name in _FLOAT_FIELDS:
+        if isinstance(value, bool):
+            raise ValueError(f"{name}={value!r} is not a number.")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name}={value!r} is not a number.") from None
+        if not number > 0:
+            raise ValueError(f"{name}={value!r} must be greater than 0.")
+        return number
     if name in _INT_FIELDS:
         if isinstance(value, bool):
             raise ValueError(f"{name}={value!r} is not an integer.")

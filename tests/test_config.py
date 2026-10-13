@@ -80,11 +80,12 @@ def test_describe_is_json_safe(monkeypatch):
     assert set(described) == {
         "voices_manifest", "extra_manifest", "voices_dir", "alerts_dir",
         "host", "port", "default_voice", "default_voices", "max_text_chars",
-        "max_alert_chars", "max_loaded_voices", "threads", "file_mode", "dir_mode",
-        "worker_isolation", "worker_user",
+        "max_alert_chars", "max_loaded_voices", "max_concurrent_synthesis",
+        "threads", "file_mode", "dir_mode",
+        "worker_isolation", "worker_user", "worker_timeout",
     }
     assert all(
-        v is None or isinstance(v, (str, int, dict)) for v in described.values()
+        v is None or isinstance(v, (str, int, float, dict)) for v in described.values()
     )
 
 
@@ -166,6 +167,15 @@ def test_override_ints_are_coerced(monkeypatch):
     assert (settings.port, settings.max_loaded_voices, settings.threads) == (5003, 2, 1)
 
 
+def test_worker_timeout_is_a_positive_float(monkeypatch):
+    _clear_env(monkeypatch)
+    assert load_settings().worker_timeout == 30.0
+    # Read as a float (seconds), from either an override or the environment.
+    assert load_settings(worker_timeout="1.5").worker_timeout == 1.5
+    monkeypatch.setenv("SYSCON_TTS_WORKER_TIMEOUT", "0.5")
+    assert load_settings().worker_timeout == 0.5
+
+
 def test_direct_construction_is_normalized_too():
     settings = Settings(
         default_voices={"es-mx": "es_mx_ald"}, file_mode="0640", port="9000",
@@ -180,7 +190,10 @@ def test_direct_construction_is_normalized_too():
 @pytest.mark.parametrize(
     "field,value",
     [("port", "not-a-port"), ("file_mode", "rw-r--r--"), ("threads", 0),
-     ("max_alert_chars", -1), ("port", True)],
+     ("max_alert_chars", -1), ("port", True), ("worker_timeout", "soon"),
+     ("worker_timeout", 0), ("worker_timeout", -1.0), ("worker_timeout", True),
+     ("worker_user", ""), ("worker_user", "  "), ("worker_user", "a b"),
+     ("worker_user", "a:b"), ("max_concurrent_synthesis", 0)],
 )
 def test_bad_values_are_rejected(field, value):
     with pytest.raises(ValueError):

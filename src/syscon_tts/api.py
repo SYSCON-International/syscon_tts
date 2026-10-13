@@ -20,10 +20,14 @@ manifest path cannot fail an import. ``syscon_tts.api:app`` still works for
 
 from __future__ import annotations
 
+import math
+import threading
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -78,6 +82,28 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.settings = settings
     app.state.registry = registry
     app.state.engine = engine
+    # Synthesis is CPU-bound and each request's memory grows with its text, so
+    # a burst of concurrent /synthesize calls can stack gigabytes while they
+    # queue on the engine's per-voice lock. FastAPI runs these sync endpoints in
+    # a threadpool, so without a gate they all enter at once. Admit a bounded
+    # number and shed the rest with 503 instead of letting the box OOM.
+    gate = threading.BoundedSemaphore(max(1, settings.max_concurrent_synthesis))
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError):
+        # pydantic echoes the offending input in its error detail. A non-finite
+        # float (NaN/inf, which allow_inf_nan=False rejects) there would make the
+        # default JSON response fail to encode -- turning a clean 422 into a 500.
+        # Sanitize non-finite inputs and drop the context so the 422 renders.
+        safe = []
+        for err in exc.errors():
+            item = dict(err)
+            value = item.get("input")
+            if isinstance(value, float) and not math.isfinite(value):
+                item["input"] = str(value)
+            item.pop("ctx", None)
+            safe.append(item)
+        return JSONResponse(status_code=422, content=jsonable_encoder({"detail": safe}))
 
     @app.get("/")
     def info():
@@ -117,6 +143,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_code=413,
                 detail=f"Text exceeds max length of {settings.max_text_chars} chars.",
             )
+        if not req.text.strip():
+            raise HTTPException(status_code=400, detail="Text must not be empty.")
+        if not gate.acquire(blocking=False):
+            raise HTTPException(
+                status_code=503,
+                detail="The synthesizer is busy; retry shortly.",
+                headers={"Retry-After": "1"},
+            )
         voice_id = resolve_voice_id(registry, settings, req.voice, req.language)
         try:
             audio, media_type = engine.synthesize(
@@ -136,6 +170,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
         except SynthesisError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            gate.release()
 
         ext = "mp3" if media_type == "audio/mpeg" else "wav"
         return Response(

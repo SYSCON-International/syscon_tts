@@ -392,8 +392,11 @@ saturates the CPU for the length of the utterance. On a host with other work
 to do, cap it with `SYSCON_TTS_THREADS` (or `threads=` as a constructor
 keyword).
 
-Expect roughly 50–120 MB resident per loaded `medium` voice; models stay in
-memory after first use to avoid reload latency.
+Expect roughly **139 MB** resident per loaded `medium` voice once it has
+rendered (the model plus onnxruntime's inference arena, allocated on first
+synthesis); models stay in memory after first use to avoid reload latency. With
+worker isolation on (the default on the APU), that memory lives in the worker
+process rather than the embedder — see `DEPLOY.md` §7 for sizing a host.
 
 ## License
 

@@ -85,6 +85,34 @@ def test_unknown_language_is_an_error(registry, fetched, tmp_path):
     assert fetched == []
 
 
+def test_language_download_falls_back_to_a_cleared_related_voice(registry, fetched, tmp_path):
+    # C-69: es-MX's native voice (es_mx_ald) is held for license review. Held
+    # voices must be filtered BEFORE narrowing to the exact locale, or the
+    # command installs nothing and exits 0 -- the Spanish site then announces in
+    # English. The cleared Castilian interim must survive the fallback instead.
+    download_voices(registry, tmp_path, language="es-mx")
+    assert fetched == ["es_es_carlfm"]
+    assert "es_mx_ald" not in fetched
+
+
+def test_language_with_only_held_voices_fails_loudly(registry, fetched, tmp_path):
+    # French has only the held fr_fr_siwis. Rather than silently install
+    # nothing, the command must raise so provisioning does not pass on an empty
+    # voices directory.
+    with pytest.raises(DownloadError) as excinfo:
+        download_voices(registry, tmp_path, language="fr-fr")
+    assert "held for license review" in str(excinfo.value)
+    assert "--accept-license" in str(excinfo.value)
+    assert fetched == []
+
+
+def test_accept_license_still_fetches_the_held_locale_voice(registry, fetched, tmp_path):
+    # With --accept-license the exact-locale preference applies to the (now
+    # un-filtered) held native voice again.
+    download_voices(registry, tmp_path, language="es-mx", accept_license=True)
+    assert fetched == ["es_mx_ald"]
+
+
 def test_unknown_voice_id_raises_before_any_download(registry, fetched, tmp_path):
     with pytest.raises(UnknownVoiceError):
         download_voices(registry, tmp_path, voice_ids=["es_mx_ald", "nope"])

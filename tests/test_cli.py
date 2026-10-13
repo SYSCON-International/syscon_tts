@@ -81,6 +81,10 @@ def test_doctor_reports_the_environment(env, capsys):
     assert "voices installed  0/8" in captured.out
     assert "default voice     en_us_kristin" in captured.out
     assert "data dir" in captured.out
+    # The worker settings are visible, so an operator can see whether the
+    # synthesis worker will run as root (C-65).
+    assert "worker isolation  on" in captured.out
+    assert "worker user       (current user)" in captured.out
     assert "download-voices" in captured.err
 
 

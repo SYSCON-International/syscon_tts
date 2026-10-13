@@ -14,16 +14,17 @@ import pytest
 
 from syscon_tts.config import Settings, default_manifest_path
 from syscon_tts.engine import SynthesisError, SynthesisUnavailableError, piper_available
-from syscon_tts.worker import _CRASH_SENTINEL, WorkerEngine
+from syscon_tts.worker import _CRASH_SENTINEL, _HANG_SENTINEL, WorkerEngine
 
 
-def _settings(tmp_path) -> Settings:
+def _settings(tmp_path, **overrides) -> Settings:
     """A worker pointed at an empty voices dir with one catalogued voice."""
     return Settings(
         voices_manifest=default_manifest_path(),
         voices_dir=tmp_path / "voices",
         alerts_dir=tmp_path / "alerts",
         default_voice="en_us_kristin",
+        **overrides,
     )
 
 
@@ -64,20 +65,102 @@ def test_a_worker_crash_becomes_synthesis_error(tmp_path, monkeypatch):
 
 def test_the_worker_respawns_after_a_crash(tmp_path, monkeypatch):
     # A single poisoned message must not wedge the service: the next request
-    # gets a fresh worker. On a host without Piper that next request surfaces
-    # as SynthesisUnavailableError, which proves a live worker answered it.
+    # gets a FRESH worker. Proven by pid: the worker that answers after the
+    # crash is a different process from the one that crashed. The probe asks
+    # about an unknown voice -- rejected before Piper is touched -- so this runs
+    # identically on Linux (Piper present, no models) and on Windows/macOS,
+    # which is the leg the previous "render real audio" version failed on.
+    from syscon_tts.voices import UnknownVoiceError
+
     monkeypatch.setenv("SYSCON_TTS_WORKER_SELFTEST", "1")
     engine = WorkerEngine(_settings(tmp_path))
     try:
+        # A benign request spawns the first worker; record its pid.
+        engine.loaded_voice_ids()
+        first_pid = engine.worker_pid
+        assert first_pid is not None
+
         with pytest.raises(SynthesisError):
             engine.synthesize_wav(_CRASH_SENTINEL, "en_us_kristin")
+        assert engine.worker_pid is None  # the crashed worker was dropped
 
+        with pytest.raises(UnknownVoiceError):
+            engine.synthesize_wav("after the crash", "no_such_voice")
+        second_pid = engine.worker_pid
+        assert second_pid is not None
+        assert second_pid != first_pid  # a genuinely new process answered
+    finally:
+        engine.close()
+
+
+def test_a_hung_worker_times_out_and_is_killed(tmp_path, monkeypatch):
+    # A crafted input that sends espeak-ng into a loop (rather than crashing)
+    # must not block the announcement forever. The request is bounded by
+    # worker_timeout; past it the worker is killed and the call raises.
+    monkeypatch.setenv("SYSCON_TTS_WORKER_SELFTEST", "1")
+    engine = WorkerEngine(_settings(tmp_path, worker_timeout=0.75))
+    try:
+        with pytest.raises(SynthesisError) as excinfo:
+            engine.synthesize_wav(_HANG_SENTINEL, "en_us_kristin")
+        assert "did not respond" in str(excinfo.value)
+        # The worker it killed must not wedge the next request: a fresh one
+        # answers (unavailable here, since this host has no Piper).
         if not piper_available():
             with pytest.raises(SynthesisUnavailableError):
-                engine.synthesize_wav("after the crash", "en_us_kristin")
-        else:  # pragma: no cover - only on a provisioned Linux host
-            audio = engine.synthesize_wav("after the crash", "en_us_kristin")
-            assert audio.startswith(b"RIFF")
+                engine.synthesize_wav("after the hang", "en_us_kristin")
+    finally:
+        engine.close()
+
+
+def test_replies_are_not_unpickled(tmp_path, monkeypatch):
+    # Hardening against High #4: the caller must never run pickle on bytes the
+    # worker sent, or a compromised worker could execute code in the root
+    # parent. A sentinel in the reply frame proves pickle.loads is not called.
+    import pickle
+
+    exploded = {"called": False}
+    real_loads = pickle.loads
+
+    def tripwire(data, *args, **kwargs):
+        exploded["called"] = True
+        return real_loads(data, *args, **kwargs)
+
+    monkeypatch.setattr(pickle, "loads", tripwire)
+    engine = WorkerEngine(_settings(tmp_path))
+    try:
+        # loaded_voice_ids goes over the wire as a JSON reply, round trip.
+        assert engine.loaded_voice_ids() == []
+    finally:
+        engine.close()
+    assert not exploded["called"], "the caller unpickled a worker reply"
+
+
+def test_worker_renders_real_audio_end_to_end():
+    # C-73: the worker's *success* path -- it actually returns WAV bytes -- was
+    # never exercised by any test. This needs real Piper AND an installed model,
+    # so it is skipped everywhere except a provisioned box and the CI synthesis
+    # job (which downloads en_us_kristin into SYSCON_TTS_VOICES_DIR first).
+    if not piper_available():
+        pytest.skip("this host cannot run Piper")
+    from syscon_tts.config import load_settings
+    from syscon_tts.voices import VoiceRegistry
+
+    settings = load_settings(default_voice="en_us_kristin")
+    reg = VoiceRegistry.from_settings(settings)
+    if not reg.is_installed(reg.get("en_us_kristin")):
+        pytest.skip("en_us_kristin model is not installed")
+
+    engine = WorkerEngine(settings)
+    try:
+        audio = engine.synthesize_wav("Machine four fault detected.", "en_us_kristin")
+        assert audio.startswith(b"RIFF")
+        assert len(audio) > 1000
+        # The same worker handles a second request -- the model cache stays warm
+        # across requests (that is why isolation costs nothing per announcement).
+        pid = engine.worker_pid
+        again = engine.synthesize_wav("Second announcement.", "en_us_kristin")
+        assert again.startswith(b"RIFF")
+        assert engine.worker_pid == pid
     finally:
         engine.close()
 
@@ -97,3 +180,28 @@ def test_close_is_idempotent(tmp_path):
     engine = WorkerEngine(_settings(tmp_path))
     engine.close()
     engine.close()  # must not raise even though nothing was ever spawned
+
+
+def test_alert_synthesizer_survives_a_worker_crash(tmp_path, monkeypatch):
+    # Medium #20, the end-to-end path the APU actually uses: a crash in the
+    # worker must surface to AlertSynthesizer.ensure() as a catchable
+    # SynthesisError, never take down the caller. We force the worker engine
+    # (otherwise a Piper-less host would use the in-process engine and never
+    # spawn one), then drive a crash vector through ensure() the way an alert
+    # would arrive. The test process standing in for the root Tornado manager
+    # catches the error and keeps running -- which is the whole property.
+    from syscon_tts.alerts import AlertSynthesizer
+
+    monkeypatch.setenv("SYSCON_TTS_WORKER_SELFTEST", "1")
+    settings = _settings(tmp_path)
+    worker = WorkerEngine(settings)
+    synth = AlertSynthesizer(settings=settings, engine=worker)
+    try:
+        with pytest.raises(SynthesisError):
+            synth.ensure(_CRASH_SENTINEL)
+        # The manager is still alive and the next alert gets a fresh worker.
+        if not piper_available():
+            with pytest.raises(SynthesisUnavailableError):
+                synth.ensure("the plant keeps announcing")
+    finally:
+        worker.close()

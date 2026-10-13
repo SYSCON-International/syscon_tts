@@ -54,6 +54,37 @@ def _build_registry_and_engine(threads=None):
     return settings, registry, engine
 
 
+def _installed_voice(registry: VoiceRegistry, voice_id: str) -> bool:
+    """True for a catalogued voice whose model files are on disk."""
+    return registry.has(voice_id) and registry.is_installed(registry.get(voice_id))
+
+
+def _check_worker(settings, voice_id: str) -> list:
+    """Load one voice through a real worker; return any problem it surfaces.
+
+    This is what catches a ``worker_user`` typo or an account that cannot read
+    the voices directory: the model is installed, but the worker -- which runs
+    as that account -- cannot load it, so every announcement would fail while a
+    cheaper check said "Ready."
+    """
+    from .worker import WorkerEngine
+
+    engine = WorkerEngine(settings)
+    try:
+        engine.preload(voice_id)
+        return []
+    except Exception as exc:  # noqa: BLE001 - any worker failure is a problem
+        who = settings.worker_user or "the current user"
+        return [
+            f"The synthesis worker (running as {who}) could not load installed "
+            f"voice '{voice_id}': {exc}. Check that SYSCON_TTS_WORKER_USER names "
+            f"an account that exists and can read {settings.voices_dir} (models "
+            "must be group- or world-readable for it)."
+        ]
+    finally:
+        engine.close()
+
+
 def _cmd_list_voices(args: argparse.Namespace) -> int:
     settings, registry, _ = _build_registry_and_engine()
     profiles = registry.all()
@@ -108,6 +139,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     has_piper = piper_available()
     print(f"  piper (synthesis) {'yes' if has_piper else 'no'}")
+    print(f"  worker isolation  {'on' if settings.worker_isolation else 'off'}")
+    if settings.worker_isolation:
+        print(f"  worker user       {settings.worker_user or '(current user)'}")
+        print(f"  worker timeout    {settings.worker_timeout:g}s")
 
     try:
         registry = VoiceRegistry.from_settings(settings)
@@ -223,6 +258,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         # sounds, or is something else entirely.
         for profile in installed:
             problems.extend(verify_voice(profile, settings.voices_dir))
+
+    # Exercise the real worker. A typo in worker_user, or an account that
+    # cannot read the voices directory, makes every announcement fail even
+    # though doctor would otherwise print "Ready." -- the models ARE installed,
+    # the worker just cannot reach them. Only meaningful with Piper, an
+    # installed voice to load, and isolation on; and the drop to worker_user is
+    # only exercised when doctor itself runs as root (as it does on the APU).
+    if (
+        not args.quick
+        and settings.worker_isolation
+        and has_piper
+        and installed
+        and not problems
+    ):
+        probe = (
+            settings.default_voice
+            if _installed_voice(registry, settings.default_voice)
+            else installed[0].id
+        )
+        problems.extend(_check_worker(settings, probe))
 
     if problems:
         # stdout is block-buffered when piped while stderr is not, so the

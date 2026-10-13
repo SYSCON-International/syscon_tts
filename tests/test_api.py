@@ -77,16 +77,29 @@ def test_synthesize_text_too_long_returns_413(client):
     [
         ({}, 422),                                   # text is required
         ({"text": "hi", "format": "ogg"}, 400),      # unsupported format
-        ({"text": "hi", "speed": 0}, 422),           # below the 0.5 floor
-        ({"text": "hi", "speed": 0.4}, 422),         # still below it
-        ({"text": "hi", "speed": 2.01}, 422),        # above the 2.0 ceiling
-        ({"text": "hi", "sentence_silence": 1.01}, 422),  # above the 1 s cap
+        # -- speed bounds: inclusive at the edges, rejected past them. The edge
+        #    cases pin `ge`/`le` so a mutation to `gt`/`lt` is caught.
+        ({"text": "hi", "speed": 0.5}, 200),         # exactly the floor: allowed
+        ({"text": "hi", "speed": 2.0}, 200),         # exactly the ceiling: allowed
+        ({"text": "hi", "speed": 0}, 422),
+        ({"text": "hi", "speed": 0.49}, 422),
+        ({"text": "hi", "speed": 2.01}, 422),
+        # -- silence bounds: 0 is allowed (pins `ge=0`), negative is not.
+        ({"text": "hi", "sentence_silence": 0}, 200),
+        ({"text": "hi", "sentence_silence": -0.1}, 422),
+        ({"text": "hi", "sentence_silence": 1.0}, 200),  # exactly the cap
+        ({"text": "hi", "sentence_silence": 1.01}, 422),
+        # -- 413 is off-by-one sensitive: exactly the limit is allowed, one over
+        #    is refused (client fixture sets max_text_chars=100).
+        ({"text": "x" * 100}, 200),
+        ({"text": "x" * 101}, 413),
     ],
 )
 def test_synthesize_rejects_bad_input(client, monkeypatch, payload, status):
-    # The DoS guard (speed/silence bounds) and the format mapping must be
-    # enforced, not fall through to a 500. For the 400 case, synthesis is
-    # reached with a bad format and must map to 400, so stub the engine.
+    # The DoS guard (speed/silence bounds), the length cap and the format
+    # mapping must be enforced exactly, not fall through to a 500. The engine is
+    # stubbed so the accepted cases return 200 and the bad-format case maps to
+    # 400 at the engine boundary.
     def fake_synth(self, text, voice_id, fmt="wav", speed=1.0, sentence_silence=0.2):
         from syscon_tts.engine import SynthesisError
 
@@ -99,13 +112,68 @@ def test_synthesize_rejects_bad_input(client, monkeypatch, payload, status):
     assert r.status_code == status
 
 
-def test_synthesize_empty_text_is_rejected(client, monkeypatch):
-    # Empty/whitespace text reaches the engine, which raises SynthesisError
-    # -> 400, not a 500.
-    r = client.post("/synthesize", json={"text": "   "})
-    # Either the engine rejects it (400) or, on a host without a model, the
-    # missing-model/engine path answers first -- both are decidable, non-500.
-    assert r.status_code in (400, 501, 503)
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_synthesize_rejects_non_finite_speed(client, bad):
+    # NaN/inf cannot be sent through a strict JSON encoder, so a client can only
+    # produce them with a hand-built body -- which an attacker will. The server
+    # must reject them (allow_inf_nan=False) with 422, not let NaN through to
+    # the engine and 500. Posted as raw content for that reason.
+    r = client.post(
+        "/synthesize",
+        content=f'{{"text": "hi", "speed": {bad}}}',
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 422
+
+
+def test_synthesize_empty_text_is_exactly_400(client):
+    # Blank/whitespace text is a client error decided before synthesis -- it
+    # must be exactly 400, never a 500 or a host-dependent 501/503.
+    for text in ("", "   ", "\n\t"):
+        r = client.post("/synthesize", json={"text": text})
+        assert r.status_code == 400, text
+
+
+def test_synthesize_sheds_load_with_503_when_busy(tmp_path, monkeypatch):
+    # The concurrency gate: with one slot, a second request that arrives while
+    # the first is mid-synthesis gets 503 rather than stacking memory.
+    import threading
+
+    settings = Settings(
+        voices_manifest=default_manifest_path(),
+        voices_dir=tmp_path / "voices",
+        alerts_dir=tmp_path / "alerts",
+        default_voice="en_us_kristin",
+        max_concurrent_synthesis=1,
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+
+    in_synth = threading.Event()
+    release = threading.Event()
+
+    def blocking_synth(self, text, voice_id, fmt="wav", speed=1.0, sentence_silence=0.2):
+        in_synth.set()
+        release.wait(5)
+        return b"RIFFdata", "audio/wav"
+
+    monkeypatch.setattr(engine_mod.TTSEngine, "synthesize", blocking_synth)
+
+    results = {}
+
+    def first():
+        results["first"] = client.post("/synthesize", json={"text": "one"}).status_code
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert in_synth.wait(5), "the first request never entered synthesis"
+    # Second request arrives while the first holds the only slot.
+    results["second"] = client.post("/synthesize", json={"text": "two"}).status_code
+    release.set()
+    t.join(5)
+
+    assert results["first"] == 200
+    assert results["second"] == 503
 
 
 def test_synthesize_uses_default_voice(client, monkeypatch):
