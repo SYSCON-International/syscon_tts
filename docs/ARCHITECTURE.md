@@ -6,7 +6,7 @@ Architecture, components, deployment, operations, and interface reference.
 - **Scope:** how it is built and how it runs. For a quick start see
   [README.md](../README.md); for step-by-step deployment recipes see
   [DEPLOY.md](../DEPLOY.md).
-- **Version:** 0.1.1
+- **Version:** 0.1.2
 
 ---
 
@@ -652,7 +652,7 @@ still works, because `app` is built lazily on first access.
 
 ### `GET /`
 ```json
-{"service":"Syscon TTS","version":"0.1.1","engine":"piper",
+{"service":"Syscon TTS","version":"0.1.2","engine":"piper",
  "default_voice":"en_us_kristin","endpoints":["/health","/voices","/synthesize"]}
 ```
 

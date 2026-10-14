@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.2
+
+### Added
+
+- **`AlertSynthesizer.close()`** stops the synthesizer for good. With worker
+  isolation its engine is a process holding every loaded model, and before
+  this nothing stopped it: a caller that replaced its synthesizer (the APU
+  does, when a site voice is added after startup) left the old worker running
+  until the service restarted. `close()` waits for a synthesis already in
+  flight.
+- **`SynthesizerClosedError`** (a `SynthesisError`). A closed synthesizer or
+  `WorkerEngine` raises it instead of quietly starting a new worker, so a
+  caller that fetched the old instance just before it was replaced cannot leak
+  one. Retry on the replacement. A cache hit on a closed synthesizer is still
+  returned, since it needs no engine.
+
 ## 0.0.5
 
 ### Integrators must act

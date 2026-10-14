@@ -7,4 +7,4 @@ version from here, so the two can never disagree -- the drift that shipped a
 to cut a release; nothing else records the number.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

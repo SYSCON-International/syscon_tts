@@ -54,6 +54,14 @@ class SynthesisError(SysconTTSError):
     """Raised when audio synthesis fails."""
 
 
+class SynthesizerClosedError(SynthesisError):
+    """Raised when a closed engine or :class:`AlertSynthesizer` must synthesize.
+
+    Not a fault in the text or the voice: the caller fetched a synthesizer
+    that was then replaced and closed. Retry on the current one.
+    """
+
+
 class SynthesisUnavailableError(SynthesisError):
     """Raised when Piper is not usable on this machine.
 

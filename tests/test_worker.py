@@ -13,7 +13,14 @@ where Piper cannot run at all.
 import pytest
 
 from syscon_tts.config import Settings, default_manifest_path
-from syscon_tts.engine import SynthesisError, SynthesisUnavailableError, piper_available
+from syscon_tts.engine import (
+    SynthesisError,
+    SynthesisUnavailableError,
+    SynthesizerClosedError,
+    TTSEngine,
+    piper_available,
+)
+from syscon_tts.voices import VoiceRegistry
 from syscon_tts.worker import _CRASH_SENTINEL, _HANG_SENTINEL, WorkerEngine
 
 
@@ -180,6 +187,71 @@ def test_close_is_idempotent(tmp_path):
     engine = WorkerEngine(_settings(tmp_path))
     engine.close()
     engine.close()  # must not raise even though nothing was ever spawned
+
+
+def test_a_closed_engine_never_spawns_another_worker(tmp_path, monkeypatch):
+    # A caller still holding an engine that was replaced and closed must get
+    # an error, not a fresh worker that nothing will ever stop.
+    monkeypatch.setenv("SYSCON_TTS_WORKER_SELFTEST", "1")
+    engine = WorkerEngine(_settings(tmp_path))
+    with pytest.raises(SynthesisError):
+        engine.synthesize_wav(_CRASH_SENTINEL, "en_us_kristin")  # spawns one
+    engine.close()
+
+    spawned = []
+    monkeypatch.setattr(engine, "_ensure_worker", lambda: spawned.append(True))
+    with pytest.raises(SynthesizerClosedError):
+        engine.synthesize_wav("hello", "en_us_kristin")
+    with pytest.raises(SynthesizerClosedError):
+        engine.preload("en_us_kristin")
+    assert engine.loaded_voice_ids() == []
+    assert spawned == []
+    assert engine.worker_pid is None
+
+
+def test_a_closed_alert_synthesizer_refuses_to_render(tmp_path):
+    from syscon_tts.alerts import AlertSynthesizer
+
+    settings = _settings(tmp_path)
+    synth = AlertSynthesizer(settings=settings, engine=TTSEngine(VoiceRegistry.from_settings(settings)))
+    synth.close()
+    synth.close()  # idempotent, and the in-process engine has no close()
+
+    with pytest.raises(SynthesizerClosedError):
+        synth.ensure("the plant keeps announcing")
+    with pytest.raises(SynthesizerClosedError):
+        synth.preload()
+
+
+def test_a_closed_alert_synthesizer_still_returns_a_cache_hit(tmp_path):
+    # A hit needs no engine, so a caller racing a replacement still plays it.
+    from unittest import mock
+
+    from syscon_tts.alerts import AlertSynthesizer
+
+    settings = _settings(tmp_path)
+    engine = mock.Mock()
+    engine.synthesize_wav.return_value = _silent_wav()
+    synth = AlertSynthesizer(settings=settings, engine=engine)
+    first = synth.ensure("press four is down")
+    synth.close()
+
+    engine.close.assert_called_once_with()
+    again = synth.ensure("press four is down")
+    assert again.cached and again.path == first.path
+
+
+def _silent_wav() -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(b"\x00\x00" * 100)
+    return buf.getvalue()
 
 
 def test_alert_synthesizer_survives_a_worker_crash(tmp_path, monkeypatch):

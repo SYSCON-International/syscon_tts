@@ -55,7 +55,7 @@ from typing import Any, Optional
 
 from . import tempfiles
 from .config import Settings, load_settings
-from .engine import SynthesisError, TTSEngine, piper_available
+from .engine import SynthesisError, SynthesizerClosedError, TTSEngine, piper_available
 from .errors import SysconTTSError
 from .voices import UnknownVoiceError, VoiceRegistry, normalize_language
 
@@ -358,6 +358,32 @@ class AlertSynthesizer:
         # Directories already swept for orphaned temp files.
         self._swept: set = set()
         self._swept_lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        """Stop this synthesizer for good. Safe to call more than once.
+
+        Call it on an instance being replaced: with worker isolation the engine
+        is a process holding every loaded model, and nothing else stops it.
+        Waits for a synthesis already in flight. Afterwards a cache hit is
+        still returned, but anything that must be rendered raises
+        :class:`~syscon_tts.engine.SynthesizerClosedError` -- retry on the
+        replacement.
+        """
+        self._closed = True
+        close_engine = getattr(self.engine, "close", None)
+        if close_engine is not None:
+            close_engine()
+
+    def _raise_if_closed(self) -> None:
+        # The in-process engine has no close() of its own, so the synthesizer
+        # refuses too; a WorkerEngine also refuses by itself, which covers a
+        # caller already past this check when close() ran.
+        if self._closed:
+            raise SynthesizerClosedError(
+                "This AlertSynthesizer has been closed; use the one that "
+                "replaced it."
+            )
 
     # -- lookup ------------------------------------------------------------
 
@@ -423,6 +449,7 @@ class AlertSynthesizer:
         while somebody is waiting to hear an announcement.
         """
         voice_id = self.resolve_voice(voice, language)
+        self._raise_if_closed()
         self.engine.preload(voice_id)
         return voice_id
 
@@ -467,6 +494,9 @@ class AlertSynthesizer:
           model files are not on disk.
         * :class:`~syscon_tts.engine.SynthesisUnavailableError` -- the file
           has to be rendered and this machine cannot run Piper.
+        * :class:`~syscon_tts.engine.SynthesizerClosedError` -- the file has
+          to be rendered and :meth:`close` has been called. Retry on the
+          synthesizer that replaced this one.
         * :class:`~syscon_tts.engine.SynthesisError` -- Piper failed.
         * :class:`AlertWriteError` -- the directory or file could not be
           written. It is also an ``OSError``.
@@ -509,6 +539,7 @@ class AlertSynthesizer:
             else:
                 logger.debug("Cache miss: %s", dest.name)
 
+            self._raise_if_closed()
             audio = self.engine.synthesize_wav(
                 text,
                 voice_id,

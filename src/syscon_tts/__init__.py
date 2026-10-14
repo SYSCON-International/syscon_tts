@@ -54,6 +54,7 @@ from .download import (
 from .engine import (
     SynthesisError,
     SynthesisUnavailableError,
+    SynthesizerClosedError,
     TTSEngine,
     piper_available,
 )
@@ -83,6 +84,7 @@ __all__ = [
     "Settings",
     "SynthesisError",
     "SynthesisUnavailableError",
+    "SynthesizerClosedError",
     "SysconTTSError",
     "TTSEngine",
     "UnknownVoiceError",

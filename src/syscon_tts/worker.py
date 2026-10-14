@@ -76,6 +76,7 @@ from .config import Settings
 from .engine import (
     SynthesisError,
     SynthesisUnavailableError,
+    SynthesizerClosedError,
     TTSEngine,
 )
 from .errors import SysconTTSError
@@ -284,6 +285,7 @@ class WorkerEngine:
         self._replies: queue.Queue = queue.Queue()
         self._reader: Optional[threading.Thread] = None
         self._root_warned = False
+        self._closed = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -404,8 +406,15 @@ class WorkerEngine:
             pass
 
     def close(self) -> None:
-        """Stop the worker. Safe to call more than once."""
+        """Stop the worker for good. Safe to call more than once.
+
+        Waits for a request already in flight. Every later request raises
+        :class:`~syscon_tts.engine.SynthesizerClosedError` instead of spawning
+        a new worker -- otherwise a caller still holding a replaced engine
+        would quietly start a process nothing will ever stop.
+        """
         with self._lock:
+            self._closed = True
             if self._proc is not None and self._proc.poll() is None:
                 try:
                     _write_frame(self._proc.stdin, json.dumps(["stop"]).encode("utf-8"))
@@ -445,6 +454,11 @@ class WorkerEngine:
         nothing from the worker is ever unpickled.
         """
         with self._lock:
+            if self._closed:
+                raise SynthesizerClosedError(
+                    "This synthesis engine has been closed; use the one that "
+                    "replaced it."
+                )
             self._ensure_worker()
             try:
                 _write_frame(self._proc.stdin, json.dumps(message).encode("utf-8"))
