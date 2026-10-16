@@ -180,24 +180,28 @@ def test_for_language_prefers_the_exact_locale(tmp_path):
     assert any(p.language == "es_ES" for p in matches)
 
 
-#: Every catalogued voice fine-tuned from research-only en_US-lessac. Each was
-#: verified against its MODEL_CARD at the pinned commit; all must stay held
-#: until legal clears the lineage, or French/German/Chinese/Spanish sites ship
-#: a voice we may not be licensed to sell. See voices.json _review_lessac.
+#: Every catalogued voice fine-tuned from en_US-lessac, verified against its
+#: MODEL_CARD at the pinned commit. The lineage was cleared on 2026-10-16, so
+#: these ship cleared -- except huayan, whose dataset license is Unknown. See
+#: voices.json _review_lessac.
 _LESSAC_FAMILY = ("es_mx_ald", "es_es_davefx", "fr_fr_siwis", "de_de_thorsten", "zh_cn_huayan")
 
 
-def test_lineage_override_holds_the_lessac_family():
-    # These voices have a permissive (or, for huayan, Unknown) *dataset* license
-    # but a model lineage that traces to the research-only lessac voice, so they
-    # must not ship to a customer uncleared. siwis/thorsten are the trap: their
-    # datasets (CC BY 4.0 / CC0) are permissive, so without the explicit hold
-    # they would read as cleared.
+def test_lessac_family_is_cleared_explicitly_except_huayan():
+    # The clearance is recorded as an explicit license_review_required: false,
+    # not by deleting the field, so the decision is visible in the manifest and
+    # reversible in one place. Huayan keeps its hold: clearing the lineage does
+    # nothing about its Unknown dataset license.
     reg = VoiceRegistry.from_manifest(default_manifest_path(), Path("."))
     for voice_id in _LESSAC_FAMILY:
         profile = reg.get(voice_id)
-        assert profile.requires_license_review, voice_id
         assert "lessac" in profile.lineage.lower(), voice_id
+        if voice_id == "zh_cn_huayan":
+            assert profile.requires_license_review
+            assert license_key(profile.license) not in PERMISSIVE_LICENSES
+        else:
+            assert profile.license_review_required is False, voice_id
+            assert not profile.requires_license_review, voice_id
 
 
 def test_only_known_clean_voices_ship_cleared():
@@ -206,7 +210,11 @@ def test_only_known_clean_voices_ship_cleared():
     # deliberately, not slip through: this test fails until someone does.
     reg = VoiceRegistry.from_manifest(default_manifest_path(), Path("."))
     cleared = {v.id for v in reg.all() if not v.requires_license_review}
-    assert cleared == {"en_us_kristin", "en_us_john", "es_es_carlfm"}
+    assert cleared == {
+        "en_us_kristin", "en_us_john", "es_es_carlfm",
+        # lessac lineage, cleared 2026-10-16
+        "es_mx_ald", "es_es_davefx", "fr_fr_siwis", "de_de_thorsten",
+    }
 
 
 def test_interim_castilian_substitute_is_clean():

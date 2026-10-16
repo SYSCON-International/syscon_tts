@@ -266,10 +266,10 @@ def download_voices(
             profiles = matches
 
         # Held voices are filtered out BEFORE narrowing to the exact locale.
-        # Otherwise a site asking for es-MX narrows to the held es_mx_ald, which
-        # is then dropped, so the command installs nothing and exits 0 -- the
-        # Spanish site silently announces in English (C-69). Filtering first
-        # lets the cleared related-locale voice (es_es_carlfm) survive.
+        # Otherwise a site whose native voice is held (es-MX, while es_mx_ald
+        # was) narrows to it, drops it, installs nothing and exits 0 -- the site
+        # silently announces in English (C-69). Filtering first lets a cleared
+        # related-locale voice survive.
         skipped = []
         if not accept_license:
             skipped = [p for p in profiles if p.requires_license_review]

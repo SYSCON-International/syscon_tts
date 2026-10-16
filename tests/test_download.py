@@ -85,31 +85,60 @@ def test_unknown_language_is_an_error(registry, fetched, tmp_path):
     assert fetched == []
 
 
-def test_language_download_falls_back_to_a_cleared_related_voice(registry, fetched, tmp_path):
-    # C-69: es-MX's native voice (es_mx_ald) is held for license review. Held
-    # voices must be filtered BEFORE narrowing to the exact locale, or the
-    # command installs nothing and exits 0 -- the Spanish site then announces in
-    # English. The cleared Castilian interim must survive the fallback instead.
+@pytest.fixture
+def registry_with_held_ald(tmp_path):
+    """The shipped catalogue, but with es_mx_ald held as it was before 2026-10-16.
+
+    Keeps the held-native-voice fallback covered now that no shipped locale
+    has both a held native voice and a cleared relative.
+    """
+    manifest = json.loads(default_manifest_path().read_text(encoding="utf-8"))
+    for entry in manifest["voices"]:
+        if entry["id"] == "es_mx_ald":
+            entry["license_review_required"] = True
+    path = tmp_path / "voices.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return VoiceRegistry.from_manifest(path, tmp_path / "voices")
+
+
+def test_language_download_fetches_the_native_voice(registry, fetched, tmp_path):
+    # es_mx_ald is cleared, so an es-MX site gets its native voice and not the
+    # Castilian ones it will never play.
     download_voices(registry, tmp_path, language="es-mx")
-    assert fetched == ["es_es_carlfm"]
+    assert fetched == ["es_mx_ald"]
+
+
+def test_language_download_falls_back_to_a_cleared_related_voice(
+    registry_with_held_ald, fetched, tmp_path
+):
+    # C-69: when a locale's native voice is held, held voices must be filtered
+    # BEFORE narrowing to the exact locale, or the command installs nothing and
+    # exits 0 -- the site then announces in English. The cleared same-language
+    # voices must survive the fallback instead.
+    download_voices(registry_with_held_ald, tmp_path, language="es-mx")
+    assert set(fetched) == {"es_es_carlfm", "es_es_davefx"}
     assert "es_mx_ald" not in fetched
 
 
 def test_language_with_only_held_voices_fails_loudly(registry, fetched, tmp_path):
-    # French has only the held fr_fr_siwis. Rather than silently install
+    # Mandarin has only the held zh_cn_huayan. Rather than silently install
     # nothing, the command must raise so provisioning does not pass on an empty
     # voices directory.
     with pytest.raises(DownloadError) as excinfo:
-        download_voices(registry, tmp_path, language="fr-fr")
+        download_voices(registry, tmp_path, language="zh-hans")
     assert "held for license review" in str(excinfo.value)
     assert "--accept-license" in str(excinfo.value)
     assert fetched == []
 
 
-def test_accept_license_still_fetches_the_held_locale_voice(registry, fetched, tmp_path):
+def test_accept_license_still_fetches_the_held_locale_voice(
+    registry_with_held_ald, fetched, tmp_path
+):
     # With --accept-license the exact-locale preference applies to the (now
     # un-filtered) held native voice again.
-    download_voices(registry, tmp_path, language="es-mx", accept_license=True)
+    download_voices(
+        registry_with_held_ald, tmp_path, language="es-mx", accept_license=True
+    )
     assert fetched == ["es_mx_ald"]
 
 

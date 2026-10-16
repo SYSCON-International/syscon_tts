@@ -10,7 +10,7 @@ previous VoiceText integration.
   TTS. No GPU required.
 - **Interfaces:** a Python library (what the APU uses), a CLI, and an optional
   HTTP server.
-- **Voices:** seven voices across five languages out of the box — including
+- **Voices:** eight voices across five languages out of the box — including
   every locale the APU's UI offers — configured in a single JSON manifest, and
   extensible per deployment by dropping model files into the voices directory.
 - **Licensing:** the shipped catalogue only contains voices whose upstream
@@ -130,6 +130,7 @@ falling back to the default voice at WARNING. Attach a handler to see them.
 | `en_us_john` | en_US | John — male | public domain |
 | `es_mx_ald` | es_MX | Ald — Mexican Spanish | Unlicense |
 | `es_es_davefx` | es_ES | DaveFX — male (Castilian) | CC0 |
+| `es_es_carlfm` | es_ES | CarlFM — male (Castilian, x_low) | public domain |
 | `zh_cn_huayan` | zh_CN | Huayan — Mandarin | **unknown — needs review** |
 | `fr_fr_siwis` | fr_FR | Siwis — female | CC BY 4.0 (attribution) |
 | `de_de_thorsten` | de_DE | Thorsten — male | CC0 |
@@ -139,6 +140,12 @@ PlantStar ships to paying customers, so licenses are tracked per voice.
 `list-voices` shows them, `doctor` flags anything installed that still needs a
 review, and a bulk `download-voices` skips those voices unless you pass
 `--accept-license`.
+
+The Spanish, French, German and Mandarin voices are fine-tuned from
+`en_US-lessac`, whose training data is described as research-only. That lineage
+was cleared for commercial use on 2026-10-16; see DEPLOY.md "The lessac-lineage
+voices are cleared". Credit the SIWIS corpus (CC BY 4.0) wherever the product
+credits third-party components.
 
 Voices deliberately **not** catalogued: `en_US-ryan`, `en_US-hfc_female`,
 `en_US-hfc_male` and `zh_CN-xiao_ya` (CC BY-NC-SA — non-commercial);
@@ -160,7 +167,7 @@ The APU knows the site's locale; it does not need a voice-id table.
 
 ```python
 synthesizer.ensure(message, language="es-mx")   # -> es_mx_ald
-synthesizer.ensure(message, language="zh-hant") # -> zh_cn_huayan
+synthesizer.ensure(message, language="zh-hant") # -> zh_cn_huayan, if installed
 ```
 
 `en`/`en-us`, `es`/`es-mx`, and `zh`/`zh-hans`/`zh-hant`/`zh-Hant-TW` all
@@ -171,7 +178,7 @@ can serve falls back to the default voice — on a plant floor, an announcement
 in the wrong accent beats silence. Per-language defaults are configurable:
 
 ```
-SYSCON_TTS_DEFAULT_VOICES=es-mx=es_mx_ald,zh-hans=zh_cn_huayan
+SYSCON_TTS_DEFAULT_VOICES=es-es=es_es_carlfm
 ```
 
 One utterance is rendered by one voice, so a message mixing two languages is

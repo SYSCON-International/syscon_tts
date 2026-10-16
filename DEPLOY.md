@@ -73,8 +73,9 @@ see pyproject's dependency comment.
 > voice configured in the *catalogue/env*, not the per-site **TTS Voice
 > Overrides** value the APU may have stored (that lives in the APU DB); and it
 > does not know the APU catalogue's own license state — a voice held in the
-> package catalogue (es_mx_ald, fr_fr_siwis, …) is only held on the APU if the
-> APU catalogue mirrors the hold (C-63). Confirm the overrides value and the
+> package catalogue (zh_cn_huayan) is only held on the APU if the APU catalogue
+> mirrors the hold, and a voice cleared here is only offered on the APU once
+> the APU catalogue releases it (C-63). Confirm the overrides value and the
 > APU catalogue's holds by hand.
 
 `doctor` is the gate. It exits non-zero and explains the problem if Piper is
@@ -454,58 +455,48 @@ Per-language defaults let one site announce in several languages without any
 APU-side table:
 
 ```
-SYSCON_TTS_DEFAULT_VOICES=es-mx=es_es_carlfm
+SYSCON_TTS_DEFAULT_VOICES=es-es=es_es_carlfm
 ```
 
-#### Several native voices are held for license review (lessac lineage)
+(Only needed to override the automatic choice — here, the smaller Castilian
+voice instead of `es_es_davefx`. An exact-locale voice always wins otherwise.)
+
+#### The lessac-lineage voices are cleared (2026-10-16)
 
 Five catalogued voices are fine-tuned from `en_US-lessac`, whose Blizzard 2013
-data is research-only and excludes commercial voice synthesis. The *dataset*
-license of each is fine (public domain / CC0 / CC BY 4.0, or Unknown for
-Huayan); the **model lineage** is the problem. Each is therefore **held for
-license review** — `doctor` flags it and a bulk `download-voices` skips it —
-until legal signs off on the lineage:
+data is described as research-only. Their *dataset* licenses are fine (public
+domain / CC0 / CC BY 4.0, or Unknown for Huayan); the model lineage was the
+open question, and those voices were held for license review until it was
+decided. The lineage was cleared for commercial use on 2026-10-16:
 
-| Language | Held voice | Cleared substitute in this catalogue |
+| Language | Voice | Status |
 | --- | --- | --- |
-| Spanish (Mexico) | `es_mx_ald` | **`es_es_carlfm`** (interim — see below) |
-| Spanish (Spain) | `es_es_davefx` | `es_es_carlfm` |
-| French | `fr_fr_siwis` | **none** |
-| German | `de_de_thorsten` | **none** |
-| Mandarin Chinese | `zh_cn_huayan` | **none** (also held for an Unknown dataset license) |
+| Spanish (Mexico) | `es_mx_ald` | cleared — the es-MX voice |
+| Spanish (Spain) | `es_es_davefx` | cleared (`es_es_carlfm`, x_low, is also available) |
+| French | `fr_fr_siwis` | cleared — credit the SIWIS corpus (CC BY 4.0) |
+| German | `de_de_thorsten` | cleared |
+| Mandarin Chinese | `zh_cn_huayan` | **still held** — dataset license is Unknown |
 
-Only Spanish has a cleared stand-in. **French, German and Chinese have no
-cleared voice in this catalogue**, so until the lineage is cleared a site in
-those languages falls back to the default English voice (an announcement in the
-wrong language). Options for those locales: wait for legal sign-off, add a
-cleared voice for the locale via `SYSCON_TTS_EXTRA_MANIFEST`, or have the
-operator explicitly accept the risk. Do **not** quietly map `fr`/`de`/`zh` to a
-held voice. (This is why the per-language example above no longer includes
-`zh-hans=zh_cn_huayan` — Huayan is held.)
+**Sites on the old Mexican Spanish interim** (`es-mx=es_es_carlfm`) should drop
+that mapping and run `syscon-tts download-voices --language es-mx`; the native
+`es_mx_ald` is then selected automatically. A French or German site that fell
+back to English needs only the download.
 
-For **Mexican Spanish**, map to **`es_es_carlfm`** — cleared for commercial use
-(trained from scratch, public-domain dataset). It is Castilian (Spain) accent at
-`x_low`/16 kHz: intelligible for short PA announcements, not native. That is the
-mapping shown above (`es-mx=es_es_carlfm`).
-
-**To clear the family once legal signs off on the lessac lineage** — set
-`"license_review_required": false` on `es_mx_ald`, `es_es_davefx`,
-`fr_fr_siwis` and `de_de_thorsten` in `src/syscon_tts/data/voices.json` (that
-alone makes `doctor` and bulk `download-voices` treat them as cleared), and
-change any interim mapping (e.g. `es-mx=es_es_carlfm` → `es-mx=es_mx_ald`).
-`zh_cn_huayan` is **not** cleared by that step — its Unknown dataset license is
-a separate hold. The whole plan is in `voices.json` under `_review_lessac` and
-`_review_es_mx`. The clean long-term fix for any locale is to retrain on its own
-permissive dataset from a non-lessac base.
+**Mandarin is still unresolved.** Clearing the lineage did not touch Huayan's
+Unknown dataset license, so a Chinese site still falls back to the default
+English voice unless the operator explicitly accepts the risk
+(`download-voices zh_cn_huayan --accept-license`). The reasoning and how to
+reverse the clearance are in `voices.json` under `_review_lessac` and
+`_review_es_mx`.
 
 > **⚠️ The APU has its own voice catalogue — these holds do not reach it
 > automatically.** `plantstar_apu` ships its own
 > `text_to_speech_voice_catalogue.json`, which is authoritative for the APU and
 > its Text To Speech Voices page, and the APU's explicit `voice=` ids override
-> the `SYSCON_TTS_DEFAULT_VOICES` mapping above. So a hold set here does nothing
-> on the APU until the APU catalogue mirrors it. The APU must mark the same five
-> voices held, add `es_es_carlfm`, and skip held voices in its download/overrides
-> view — see **`SECURITY_HANDOFF_APU_TTS.md` → "C-63"**. The durable fix is for
+> the `SYSCON_TTS_DEFAULT_VOICES` mapping above. So a hold set or released here
+> does nothing on the APU until the APU catalogue mirrors it. The APU must
+> release the four cleared lessac voices, keep `zh_cn_huayan` held, and skip
+> held voices in its download/overrides view — see **`SECURITY_HANDOFF_APU_TTS.md` → "C-63"**. The durable fix is for
 > the APU to consume this catalogue (`SYSCON_TTS_MANIFEST`) or generate its own
 > from it, so there is one source of truth.
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Integrators must act
+
+- **The lessac-lineage voices are cleared for commercial use.** `es_mx_ald`,
+  `es_es_davefx`, `fr_fr_siwis` and `de_de_thorsten` now carry
+  `license_review_required: false`, so `doctor` no longer flags them and a bulk
+  or `--language` `download-voices` installs them. Spanish (Mexico and Spain),
+  French and German sites get a native voice. Sites still mapping
+  `es-mx=es_es_carlfm` (the interim) should drop that mapping and run
+  `download-voices --language es-mx`. `zh_cn_huayan` stays held: its dataset
+  license is Unknown, which the lineage decision does not cover. The APU's own
+  catalogue must release the same four voices (`SECURITY_HANDOFF_APU_TTS.md`,
+  C-63). See DEPLOY "The lessac-lineage voices are cleared".
+
 ## 0.1.2
 
 ### Added
